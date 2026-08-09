@@ -25,6 +25,7 @@ from config import (
     PREMIUM_PLANS,
     STARS_PURCHASE_URL,
     PAY_SUPPORT_CONTACT,
+    PAY_SUPPORT_URL,
 )
 import database as db
 
@@ -185,7 +186,10 @@ async def cmd_terms(msg: types.Message):
 async def cmd_paysupport(msg: types.Message):
     await msg.answer(
         f"To'lov bo'yicha yordam: {PAY_SUPPORT_CONTACT}\n"
-        "Murojaatda Telegram ID va to'lov sanasini yozing."
+        "Murojaatda qaysi obunani olganingiz va to'lov sanasini yozing.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Adminga yozish", url=PAY_SUPPORT_URL)]
+        ]),
     )
 
 @dp.callback_query(F.data == "premium_terms")

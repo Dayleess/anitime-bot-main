@@ -33,7 +33,8 @@ PREMIUM_PLANS = {
 STARS_PURCHASE_URL = (
     os.getenv("STARS_PURCHASE_URL") or "https://t.me/Dayleess_Donat/172"
 )
-PAY_SUPPORT_CONTACT = os.getenv("PAY_SUPPORT_CONTACT") or "@Dayleess_Donat"
+PAY_SUPPORT_CONTACT = os.getenv("PAY_SUPPORT_CONTACT") or "@Dayleess_369"
+PAY_SUPPORT_URL = os.getenv("PAY_SUPPORT_URL") or "https://t.me/Dayleess_369"
 
 # Ma'lumotlar bazasi (Cloud uchun PostgreSQL, aks holda SQLite)
 DATABASE_URL = os.getenv("DATABASE_URL") # Masalan: postgres://user:pass@host:port/db
