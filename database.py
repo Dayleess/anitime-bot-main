@@ -1,5 +1,6 @@
 import sqlite3
 import os
+import time
 
 try:
     import psycopg2
@@ -47,6 +48,30 @@ def init_db():
                 file_id  TEXT NOT NULL
             );
         """)
+        cur.execute("""
+            ALTER TABLE animes
+            ADD COLUMN IF NOT EXISTS is_premium BOOLEAN NOT NULL DEFAULT FALSE;
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS premium_subscriptions (
+                user_id     BIGINT PRIMARY KEY,
+                expires_at  BIGINT,
+                is_vip      BOOLEAN NOT NULL DEFAULT FALSE,
+                updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS premium_payments (
+                id                         SERIAL PRIMARY KEY,
+                user_id                    BIGINT NOT NULL,
+                plan_code                  TEXT NOT NULL,
+                amount                     INTEGER NOT NULL,
+                currency                   TEXT NOT NULL,
+                telegram_payment_charge_id TEXT NOT NULL UNIQUE,
+                provider_payment_charge_id TEXT,
+                created_at                 TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
     else:
         # SQLite
         cur.executescript("""
@@ -65,6 +90,31 @@ def init_db():
                 episode  INTEGER NOT NULL,
                 file_id  TEXT NOT NULL,
                 FOREIGN KEY (anime_id) REFERENCES animes(id)
+            );
+        """)
+        cur.execute("PRAGMA table_info(animes)")
+        anime_columns = {row[1] for row in cur.fetchall()}
+        if "is_premium" not in anime_columns:
+            cur.execute(
+                "ALTER TABLE animes ADD COLUMN is_premium INTEGER NOT NULL DEFAULT 0"
+            )
+        cur.executescript("""
+            CREATE TABLE IF NOT EXISTS premium_subscriptions (
+                user_id     INTEGER PRIMARY KEY,
+                expires_at  INTEGER,
+                is_vip      INTEGER NOT NULL DEFAULT 0,
+                updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS premium_payments (
+                id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id                    INTEGER NOT NULL,
+                plan_code                  TEXT NOT NULL,
+                amount                     INTEGER NOT NULL,
+                currency                   TEXT NOT NULL,
+                telegram_payment_charge_id TEXT NOT NULL UNIQUE,
+                provider_payment_charge_id TEXT,
+                created_at                 DATETIME DEFAULT CURRENT_TIMESTAMP
             );
         """)
     conn.commit()
@@ -149,19 +199,19 @@ def list_animes_with_episode_counts() -> list[dict]:
     if DATABASE_URL and PSCOPG2_AVAILABLE:
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
-            SELECT a.id, a.title, COUNT(e.id) AS episode_count
+            SELECT a.id, a.title, a.is_premium, COUNT(e.id) AS episode_count
             FROM animes a
             LEFT JOIN episodes e ON e.anime_id = a.id
-            GROUP BY a.id, a.title
+            GROUP BY a.id, a.title, a.is_premium
             ORDER BY a.id
         """)
     else:
         cur = conn.cursor()
         cur.execute("""
-            SELECT a.id, a.title, COUNT(e.id) AS episode_count
+            SELECT a.id, a.title, a.is_premium, COUNT(e.id) AS episode_count
             FROM animes a
             LEFT JOIN episodes e ON e.anime_id = a.id
-            GROUP BY a.id, a.title
+            GROUP BY a.id, a.title, a.is_premium
             ORDER BY a.id
         """)
 
@@ -205,3 +255,162 @@ def update_anime(anime_id: int, title: str = None, description: str = None, phot
     conn.commit()
     conn.close()
     return True
+
+def set_anime_premium(anime_id: int, is_premium: bool) -> bool:
+    conn = get_connection()
+    cur = conn.cursor()
+    if DATABASE_URL and PSCOPG2_AVAILABLE:
+        cur.execute(
+            "UPDATE animes SET is_premium = %s WHERE id = %s",
+            (is_premium, anime_id),
+        )
+    else:
+        cur.execute(
+            "UPDATE animes SET is_premium = ? WHERE id = ?",
+            (int(is_premium), anime_id),
+        )
+    updated = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return updated
+
+def get_premium_status(user_id: int) -> dict:
+    conn = get_connection()
+    if DATABASE_URL and PSCOPG2_AVAILABLE:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(
+            "SELECT expires_at, is_vip FROM premium_subscriptions WHERE user_id = %s",
+            (user_id,),
+        )
+    else:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT expires_at, is_vip FROM premium_subscriptions WHERE user_id = ?",
+            (user_id,),
+        )
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return {"active": False, "is_vip": False, "expires_at": None}
+
+    status = dict(row)
+    is_vip = bool(status["is_vip"])
+    expires_at = status["expires_at"]
+    active = is_vip or (expires_at is not None and int(expires_at) > int(time.time()))
+    return {
+        "active": active,
+        "is_vip": is_vip,
+        "expires_at": int(expires_at) if expires_at is not None else None,
+    }
+
+def activate_premium(
+    user_id: int,
+    plan_code: str,
+    duration_days: int | None,
+    amount: int,
+    currency: str,
+    telegram_payment_charge_id: str,
+    provider_payment_charge_id: str = "",
+) -> dict:
+    """To'lovni bir marta yozadi va premium muddatini uzaytiradi."""
+    conn = get_connection()
+    cur = conn.cursor()
+    is_postgres = bool(DATABASE_URL and PSCOPG2_AVAILABLE)
+
+    if is_postgres:
+        # Bir foydalanuvchining bir vaqtdagi to'lovlari muddatni yo'qotib qo'ymasligi uchun.
+        cur.execute("SELECT pg_advisory_xact_lock(%s)", (user_id,))
+        cur.execute(
+            """
+            INSERT INTO premium_payments (
+                user_id, plan_code, amount, currency,
+                telegram_payment_charge_id, provider_payment_charge_id
+            ) VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (telegram_payment_charge_id) DO NOTHING
+            """,
+            (
+                user_id,
+                plan_code,
+                amount,
+                currency,
+                telegram_payment_charge_id,
+                provider_payment_charge_id,
+            ),
+        )
+    else:
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO premium_payments (
+                user_id, plan_code, amount, currency,
+                telegram_payment_charge_id, provider_payment_charge_id
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                plan_code,
+                amount,
+                currency,
+                telegram_payment_charge_id,
+                provider_payment_charge_id,
+            ),
+        )
+
+    if cur.rowcount == 0:
+        conn.close()
+        return get_premium_status(user_id)
+
+    if is_postgres:
+        cur.execute(
+            "SELECT expires_at, is_vip FROM premium_subscriptions WHERE user_id = %s FOR UPDATE",
+            (user_id,),
+        )
+    else:
+        cur.execute(
+            "SELECT expires_at, is_vip FROM premium_subscriptions WHERE user_id = ?",
+            (user_id,),
+        )
+    current_row = cur.fetchone()
+    if current_row and is_postgres:
+        current = {"expires_at": current_row[0], "is_vip": current_row[1]}
+    else:
+        current = dict(current_row) if current_row else None
+
+    now = int(time.time())
+    already_vip = bool(current and current["is_vip"])
+    if already_vip or duration_days is None:
+        expires_at = None
+        is_vip = True
+    else:
+        current_expiry = int(current["expires_at"]) if current and current["expires_at"] else 0
+        expires_at = max(now, current_expiry) + duration_days * 24 * 60 * 60
+        is_vip = False
+
+    if is_postgres:
+        cur.execute(
+            """
+            INSERT INTO premium_subscriptions (user_id, expires_at, is_vip, updated_at)
+            VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (user_id) DO UPDATE SET
+                expires_at = EXCLUDED.expires_at,
+                is_vip = EXCLUDED.is_vip,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (user_id, expires_at, is_vip),
+        )
+    else:
+        cur.execute(
+            """
+            INSERT INTO premium_subscriptions (user_id, expires_at, is_vip, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET
+                expires_at = excluded.expires_at,
+                is_vip = excluded.is_vip,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (user_id, expires_at, int(is_vip)),
+        )
+
+    conn.commit()
+    conn.close()
+    return {"active": True, "is_vip": is_vip, "expires_at": expires_at}

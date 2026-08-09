@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from datetime import datetime, timezone
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
@@ -10,12 +11,21 @@ from aiogram.types import (
     BotCommand,
     BotCommandScopeChat,
     BotCommandScopeDefault,
+    LabeledPrice,
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from config import TOKEN, ADMIN_IDS, REQUIRED_CHANNELS, POST_CHANNEL
+from config import (
+    TOKEN,
+    ADMIN_IDS,
+    REQUIRED_CHANNELS,
+    POST_CHANNEL,
+    PREMIUM_PLANS,
+    STARS_PURCHASE_URL,
+    PAY_SUPPORT_CONTACT,
+)
 import database as db
 
 logging.basicConfig(level=logging.INFO)
@@ -81,6 +91,48 @@ def subscription_keyboard(not_subscribed: list[dict], anime_id: int) -> InlineKe
     ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+def premium_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="1 oy - 50 Stars", callback_data="buy_premium:1m"),
+            InlineKeyboardButton(text="3 oy - 75 Stars", callback_data="buy_premium:3m"),
+        ],
+        [
+            InlineKeyboardButton(text="6 oy - 100 Stars", callback_data="buy_premium:6m"),
+            InlineKeyboardButton(text="1 yil - 125 Stars", callback_data="buy_premium:1y"),
+        ],
+        [InlineKeyboardButton(text="VIP umrbod - 200 Stars", callback_data="buy_premium:vip")],
+        [InlineKeyboardButton(text="Stars sotib olish", url=STARS_PURCHASE_URL)],
+        [InlineKeyboardButton(text="To'lov shartlari", callback_data="premium_terms")],
+    ])
+
+def format_premium_status(status: dict) -> str:
+    if status["is_vip"]:
+        return "VIP obunangiz umrbod faol."
+    if status["active"] and status["expires_at"]:
+        expires_at = datetime.fromtimestamp(status["expires_at"], tz=timezone.utc)
+        return f"Premium obunangiz {expires_at:%d.%m.%Y} sanasigacha faol."
+    return "Sizda hozir faol Premium obuna yo'q."
+
+async def send_premium_menu(user_id: int, premium_anime: str | None = None):
+    status = db.get_premium_status(user_id)
+    intro = ""
+    if premium_anime:
+        intro = f"<b>{premium_anime}</b> Premium foydalanuvchilar uchun.\n\n"
+    await bot.send_message(
+        user_id,
+        f"{intro}<b>AniTime Premium</b>\n\n"
+        f"1 oy - 50 Stars\n"
+        f"3 oy - 75 Stars\n"
+        f"6 oy - 100 Stars\n"
+        f"1 yil - 125 Stars\n"
+        f"VIP umrbod - 200 Stars\n\n"
+        f"{format_premium_status(status)}\n\n"
+        f"Sotib olish orqali /terms shartlarini qabul qilasiz.",
+        reply_markup=premium_keyboard(),
+        parse_mode="HTML",
+    )
+
 # ─── /start (Deep Link) ───────────────────────────────────────────────────────
 
 @dp.message(CommandStart())
@@ -102,8 +154,136 @@ async def cmd_start(msg: types.Message, state: FSMContext):
     # Oddiy start
     await msg.answer(
         "👋 Salom! Men <b>AniTime</b> botiman.\n\n"
-        "📺 Kanal postidagi <b>Yuklab olish</b> tugmasini bosing va animelarni olish uchun foydalaning.",
+        "📺 Kanal postidagi <b>Yuklab olish</b> tugmasini bosing va animelarni olish uchun foydalaning.\n\n"
+        "⭐ Premium tariflar uchun /premium buyrug'ini bosing.",
         parse_mode="HTML"
+    )
+
+@dp.message(Command("premium"))
+async def cmd_premium(msg: types.Message):
+    await send_premium_menu(msg.from_user.id)
+
+@dp.message(Command("premium_status"))
+async def cmd_premium_status(msg: types.Message):
+    status = db.get_premium_status(msg.from_user.id)
+    await msg.answer(format_premium_status(status))
+
+@dp.message(Command("terms"))
+async def cmd_terms(msg: types.Message):
+    await msg.answer(
+        "<b>AniTime Premium to'lov shartlari</b>\n\n"
+        "- Tariflar bir martalik Telegram Stars to'lovi orqali olinadi.\n"
+        "- 1, 3, 6 va 12 oylik tariflar qolgan faol muddat ustiga qo'shiladi.\n"
+        "- VIP tarif muddatsiz Premium kirish beradi.\n"
+        "- To'lov faqat Telegram muvaffaqiyatli tasdiqlaganidan keyin faollashadi.\n"
+        f"- To'lov muammolari bo'yicha aloqa: {PAY_SUPPORT_CONTACT}\n\n"
+        "To'lov tugmasini bosish orqali ushbu shartlarga rozilik bildirasiz.",
+        parse_mode="HTML",
+    )
+
+@dp.message(Command("paysupport"))
+async def cmd_paysupport(msg: types.Message):
+    await msg.answer(
+        f"To'lov bo'yicha yordam: {PAY_SUPPORT_CONTACT}\n"
+        "Murojaatda Telegram ID va to'lov sanasini yozing."
+    )
+
+@dp.callback_query(F.data == "premium_terms")
+async def callback_premium_terms(call: CallbackQuery):
+    await cmd_terms(call.message)
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("buy_premium:"))
+async def callback_buy_premium(call: CallbackQuery):
+    plan_code = call.data.split(":", maxsplit=1)[1]
+    plan = PREMIUM_PLANS.get(plan_code)
+    if not plan:
+        await call.answer("Tarif topilmadi.", show_alert=True)
+        return
+
+    status = db.get_premium_status(call.from_user.id)
+    if status["is_vip"]:
+        await call.answer("Sizda umrbod VIP allaqachon faol.", show_alert=True)
+        return
+
+    await bot.send_invoice(
+        chat_id=call.from_user.id,
+        title=f"AniTime Premium - {plan['name']}",
+        description=(
+            "AniTime Premium animelariga kirish. "
+            "To'lov bir martalik va tanlangan muddatga amal qiladi."
+        ),
+        payload=f"anitime_premium:{plan_code}",
+        currency="XTR",
+        prices=[LabeledPrice(label=plan["name"], amount=plan["price"])],
+    )
+    await call.answer()
+
+@dp.pre_checkout_query()
+async def process_pre_checkout(query: types.PreCheckoutQuery):
+    payload_prefix = "anitime_premium:"
+    plan_code = (
+        query.invoice_payload[len(payload_prefix):]
+        if query.invoice_payload.startswith(payload_prefix)
+        else ""
+    )
+    plan = PREMIUM_PLANS.get(plan_code)
+    valid_payment = bool(
+        plan
+        and query.currency == "XTR"
+        and query.total_amount == plan["price"]
+    )
+
+    await query.answer(
+        ok=valid_payment,
+        error_message=None if valid_payment else "Tarif ma'lumotlari mos kelmadi.",
+    )
+
+@dp.message(F.successful_payment)
+async def process_successful_payment(msg: types.Message):
+    payment = msg.successful_payment
+    payload_prefix = "anitime_premium:"
+    plan_code = (
+        payment.invoice_payload[len(payload_prefix):]
+        if payment.invoice_payload.startswith(payload_prefix)
+        else ""
+    )
+    plan = PREMIUM_PLANS.get(plan_code)
+    if not plan or payment.currency != "XTR" or payment.total_amount != plan["price"]:
+        logging.error("Noma'lum premium to'lovi: user_id=%s", msg.from_user.id)
+        await msg.answer(f"To'lovni tekshirishda xatolik. /paysupport: {PAY_SUPPORT_CONTACT}")
+        return
+
+    try:
+        status = db.activate_premium(
+            user_id=msg.from_user.id,
+            plan_code=plan_code,
+            duration_days=plan["days"],
+            amount=payment.total_amount,
+            currency=payment.currency,
+            telegram_payment_charge_id=payment.telegram_payment_charge_id,
+            provider_payment_charge_id=payment.provider_payment_charge_id,
+        )
+    except Exception:
+        logging.exception("Premium to'lovini bazaga yozib bo'lmadi")
+        await msg.answer(
+            "To'lov qabul qilindi, lekin obunani faollashtirishda xatolik yuz berdi. "
+            f"Iltimos, /paysupport orqali {PAY_SUPPORT_CONTACT} bilan bog'laning."
+        )
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"Premium to'lov bazaga yozilmadi. User ID: {msg.from_user.id}",
+                )
+            except Exception:
+                pass
+        return
+
+    await msg.answer(
+        f"To'lov muvaffaqiyatli. <b>{plan['name']}</b> tarifi faollashtirildi.\n\n"
+        f"{format_premium_status(status)}",
+        parse_mode="HTML",
     )
 
 async def send_anime_or_check_sub(user_id: int, anime_id: int, msg: types.Message):
@@ -140,6 +320,12 @@ async def deliver_anime(user_id: int, anime_id: int, msg: types.Message):
     if not anime:
         await bot.send_message(user_id, "❌ Anime topilmadi.")
         return
+
+    if anime.get("is_premium") and not is_admin(user_id):
+        status = db.get_premium_status(user_id)
+        if not status["active"]:
+            await send_premium_menu(user_id, anime["title"])
+            return
 
     episodes = db.get_episodes(anime_id)
     if not episodes:
@@ -294,13 +480,18 @@ async def show_list(user_id: int, msg_or_call):
     
     if animes:
         for a in animes:
-            text += f"🆔 {a['id']} | 🎬 {a['title']} ({a['episode_count']} ta epizod)\n"
+            access = "⭐ Premium" if a["is_premium"] else "🆓 Bepul"
+            text += f"🆔 {a['id']} | 🎬 {a['title']} ({a['episode_count']} ta epizod) | {access}\n"
             buttons.append([
                 InlineKeyboardButton(text=f"➕ Epizod", callback_data=f"add_episode:{a['id']}"),
                 InlineKeyboardButton(text=f"✏️ Edit", callback_data=f"edit_anime:{a['id']}"),
                 InlineKeyboardButton(text=f"🗑️ O'chirish", callback_data=f"delete_anime:{a['id']}")
             ])
             buttons.append([
+                InlineKeyboardButton(
+                    text="🆓 Bepul qilish" if a["is_premium"] else "⭐ Premium qilish",
+                    callback_data=f"toggle_premium:{a['id']}"
+                ),
                 InlineKeyboardButton(text=f"📢 {a['title']} -> Kanal", callback_data=f"post_confirm:{a['id']}")
             ])
     else:
@@ -327,6 +518,21 @@ async def cmd_list(msg: types.Message):
 @dp.callback_query(F.data == "back_to_list")
 async def callback_back_to_list(call: CallbackQuery, state: FSMContext):
     await state.clear()
+    await show_list(call.from_user.id, call)
+
+@dp.callback_query(F.data.startswith("toggle_premium:"))
+async def callback_toggle_premium(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Bu amal faqat admin uchun.", show_alert=True)
+        return
+
+    anime_id = int(call.data.split(":", maxsplit=1)[1])
+    anime = db.get_anime(anime_id)
+    if not anime:
+        await call.answer("Anime topilmadi.", show_alert=True)
+        return
+
+    db.set_anime_premium(anime_id, not bool(anime.get("is_premium")))
     await show_list(call.from_user.id, call)
 
 @dp.message(Command("help"))
@@ -366,6 +572,7 @@ async def share_to_channel(admin_id: int, anime_id: int):
     text = (
         f"🎬 <b>{anime['title']}</b>\n\n"
         f"{anime['description']}\n\n"
+        f"{'⭐ Premium anime' if anime.get('is_premium') else '🆓 Bepul anime'}\n\n"
         f"📥 Animeni ko'rish uchun quyidagi tugmani bosing:"
     )
     
@@ -539,11 +746,19 @@ async def set_commands():
     """Telegram pastki input qismida chiquvchi buyruqlar menyusi"""
     user_commands = [
         BotCommand(command="start", description="Botni ishga tushirish"),
+        BotCommand(command="premium", description="Premium tariflar"),
+        BotCommand(command="premium_status", description="Obuna holatini tekshirish"),
+        BotCommand(command="terms", description="To'lov shartlari"),
+        BotCommand(command="paysupport", description="To'lov bo'yicha yordam"),
     ]
     await bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
 
     admin_commands = [
         BotCommand(command="start",  description="Botni ishga tushirish"),
+        BotCommand(command="premium", description="Premium tariflar"),
+        BotCommand(command="premium_status", description="Obuna holatini tekshirish"),
+        BotCommand(command="terms", description="To'lov shartlari"),
+        BotCommand(command="paysupport", description="To'lov bo'yicha yordam"),
         BotCommand(command="list",   description="📋 Barcha animelar menus"),
         BotCommand(command="help",   description="🛠 Yordam"),
     ]
