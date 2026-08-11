@@ -623,21 +623,39 @@ async def callback_toggle_premium(call: CallbackQuery):
 
 @dp.message(Command("help"))
 async def cmd_help(msg: types.Message):
-    if not is_admin(msg.from_user.id):
-        return
-    await msg.answer(
-        "🛠 <b>Admin komandalari:</b>\n\n"
-        "/list — barcha animelar, yangi qo'shish, epizod qo'shish\n"
-        "/help — ushbu yordam\n\n"
-        "Premium so'rovlari sizga tasdiqlash tugmalari bilan avtomatik keladi.\n\n"
-        "<b>🎬 List menusida:</b>\n"
-        "➕ Yangi anime qo'shish\n"
-        "➕ Epizod qo'shish\n"
-        "✏️ Anime tahrirlash\n"
-        "🗑️ Animeni o'chirish\n"
-        "📢 Kanalga post qilish",
-        parse_mode="HTML"
+    help_text = (
+        "<b>AniTime botdan foydalanish</b>\n\n"
+        "<b>Anime olish:</b>\n"
+        "Kanalimizdagi anime posti ostida joylashgan "
+        "<b>Yuklab olish</b> tugmasini bosing. Bot kerakli anime va "
+        "qismlarni sizga yuboradi.\n\n"
+        "<b>Premium olish:</b>\n"
+        "1. /premium buyrug'ini yuboring.\n"
+        "2. Kerakli tarifni tanlang.\n"
+        "3. <b>Adminga yozish</b> tugmasini bosing.\n"
+        "4. To'lovni admin bilan kelishing.\n"
+        "5. To'lov tasdiqlangach, Premium avtomatik faollashtiriladi.\n\n"
+        "/premium_status - Premium muddatini tekshirish\n"
+        "/paysupport - Premium bo'yicha adminga yozish"
     )
+
+    if is_admin(msg.from_user.id):
+        help_text += (
+            "\n\n<b>Admin boshqaruvi:</b>\n"
+            "/list - barcha animelarni boshqarish\n"
+            "/help - ushbu yordam\n\n"
+            "Premium so'rovlari tasdiqlash va rad etish tugmalari bilan "
+            "sizga avtomatik keladi.\n\n"
+            "<b>List menyusida:</b>\n"
+            "Yangi anime qo'shish\n"
+            "Epizod qo'shish\n"
+            "Anime tahrirlash\n"
+            "Animeni o'chirish\n"
+            "Anime turini Bepul yoki Premium qilish\n"
+            "Kanalga post qilish"
+        )
+
+    await msg.answer(help_text, parse_mode="HTML")
 
 # ─── Post to Channel Logic ───────────────────────────────────────────────────
 
@@ -833,6 +851,7 @@ async def set_commands():
     """Telegram pastki input qismida chiquvchi buyruqlar menyusi"""
     user_commands = [
         BotCommand(command="start", description="Botni ishga tushirish"),
+        BotCommand(command="help", description="Botdan foydalanish bo'yicha yordam"),
         BotCommand(command="premium", description="Premium olish"),
         BotCommand(command="premium_status", description="Obuna holatini tekshirish"),
         BotCommand(command="paysupport", description="Premium bo'yicha yordam"),
