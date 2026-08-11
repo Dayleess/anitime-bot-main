@@ -241,6 +241,50 @@ async def callback_buy_premium(call: CallbackQuery):
     )
     await call.answer("So'rov yuborildi")
 
+async def premium_expiry_warning_worker():
+    while True:
+        try:
+            subscriptions = await asyncio.to_thread(
+                db.claim_expiring_premium_notifications
+            )
+            for subscription in subscriptions:
+                user_id = subscription["user_id"]
+                expires_at = subscription["expires_at"]
+                try:
+                    status = await asyncio.to_thread(db.get_premium_status, user_id)
+                    if (
+                        not status["active"]
+                        or status["is_vip"]
+                        or status["expires_at"] != expires_at
+                    ):
+                        continue
+                    expiry = datetime.fromtimestamp(expires_at, tz=timezone.utc)
+                    await bot.send_message(
+                        user_id,
+                        "<b>Premium obunangiz tugashiga 1 kundan kam vaqt qoldi.</b>\n\n"
+                        f"Tugash sanasi: <b>{expiry:%d.%m.%Y}</b>\n"
+                        "Xohlasangiz, quyidagi tariflardan birini tanlab "
+                        "Premium obunangizni uzaytirishingiz mumkin.",
+                        reply_markup=premium_keyboard(),
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    await asyncio.to_thread(
+                        db.release_premium_notification_claim,
+                        user_id,
+                        expires_at,
+                    )
+                    logging.exception(
+                        "Premium tugash ogohlantirishini user %s ga yuborib bo'lmadi",
+                        user_id,
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("Premium tugash muddatini tekshirishda xatolik")
+
+        await asyncio.sleep(15 * 60)
+
 @dp.callback_query(F.data.startswith("approve_premium:"))
 async def callback_approve_premium(call: CallbackQuery):
     if not is_admin(call.from_user.id):
@@ -816,7 +860,12 @@ async def main():
     await set_commands()
     # Web serverni fonda ishga tushirish
     asyncio.create_task(start_web_server())
-    await dp.start_polling(bot)
+    warning_task = asyncio.create_task(premium_expiry_warning_worker())
+    try:
+        await dp.start_polling(bot)
+    finally:
+        warning_task.cancel()
+        await asyncio.gather(warning_task, return_exceptions=True)
 
 if __name__ == "__main__":
     asyncio.run(main())

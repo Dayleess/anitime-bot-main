@@ -57,8 +57,13 @@ def init_db():
                 user_id     BIGINT PRIMARY KEY,
                 expires_at  BIGINT,
                 is_vip      BOOLEAN NOT NULL DEFAULT FALSE,
+                expiry_warning_for BIGINT,
                 updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+        """)
+        cur.execute("""
+            ALTER TABLE premium_subscriptions
+            ADD COLUMN IF NOT EXISTS expiry_warning_for BIGINT;
         """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS premium_requests (
@@ -106,6 +111,7 @@ def init_db():
                 user_id     INTEGER PRIMARY KEY,
                 expires_at  INTEGER,
                 is_vip      INTEGER NOT NULL DEFAULT 0,
+                expiry_warning_for INTEGER,
                 updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -122,6 +128,13 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_premium_requests_user_status
             ON premium_requests (user_id, status);
         """)
+        cur.execute("PRAGMA table_info(premium_subscriptions)")
+        premium_columns = {row[1] for row in cur.fetchall()}
+        if "expiry_warning_for" not in premium_columns:
+            cur.execute(
+                "ALTER TABLE premium_subscriptions "
+                "ADD COLUMN expiry_warning_for INTEGER"
+            )
     conn.commit()
     conn.close()
 
@@ -308,6 +321,102 @@ def get_premium_status(user_id: int) -> dict:
         "is_vip": is_vip,
         "expires_at": int(expires_at) if expires_at is not None else None,
     }
+
+def claim_expiring_premium_notifications(
+    within_seconds: int = 24 * 60 * 60,
+    limit: int = 100,
+) -> list[dict]:
+    now = int(time.time())
+    deadline = now + within_seconds
+    conn = get_connection()
+    cur = conn.cursor()
+    is_postgres = bool(DATABASE_URL and PSCOPG2_AVAILABLE)
+
+    if is_postgres:
+        cur.execute(
+            """
+            WITH due AS (
+                SELECT user_id
+                FROM premium_subscriptions
+                WHERE is_vip = FALSE
+                  AND expires_at > %s
+                  AND expires_at <= %s
+                  AND (
+                      expiry_warning_for IS NULL
+                      OR expiry_warning_for <> expires_at
+                  )
+                ORDER BY expires_at
+                FOR UPDATE SKIP LOCKED
+                LIMIT %s
+            )
+            UPDATE premium_subscriptions AS subscription
+            SET expiry_warning_for = subscription.expires_at
+            FROM due
+            WHERE subscription.user_id = due.user_id
+            RETURNING subscription.user_id, subscription.expires_at
+            """,
+            (now, deadline, limit),
+        )
+        rows = cur.fetchall()
+    else:
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute(
+            """
+            SELECT user_id, expires_at
+            FROM premium_subscriptions
+            WHERE is_vip = 0
+              AND expires_at > ?
+              AND expires_at <= ?
+              AND (
+                  expiry_warning_for IS NULL
+                  OR expiry_warning_for <> expires_at
+              )
+            ORDER BY expires_at
+            LIMIT ?
+            """,
+            (now, deadline, limit),
+        )
+        rows = cur.fetchall()
+        for row in rows:
+            cur.execute(
+                """
+                UPDATE premium_subscriptions
+                SET expiry_warning_for = expires_at
+                WHERE user_id = ? AND expires_at = ?
+                """,
+                (row[0], row[1]),
+            )
+
+    conn.commit()
+    conn.close()
+    return [
+        {"user_id": int(row[0]), "expires_at": int(row[1])}
+        for row in rows
+    ]
+
+def release_premium_notification_claim(user_id: int, expires_at: int) -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    if DATABASE_URL and PSCOPG2_AVAILABLE:
+        cur.execute(
+            """
+            UPDATE premium_subscriptions
+            SET expiry_warning_for = NULL
+            WHERE user_id = %s AND expiry_warning_for = %s
+            """,
+            (user_id, expires_at),
+        )
+    else:
+        cur.execute(
+            """
+            UPDATE premium_subscriptions
+            SET expiry_warning_for = NULL
+            WHERE user_id = ? AND expiry_warning_for = ?
+            """,
+            (user_id, expires_at),
+        )
+    conn.commit()
+    conn.close()
 
 def create_premium_request(user_id: int, plan_code: str) -> dict:
     conn = get_connection()
