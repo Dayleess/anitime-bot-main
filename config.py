@@ -20,19 +20,15 @@ REQUIRED_CHANNELS = [
 # Kanalga post joylash uchun kanal username yoki ID si
 POST_CHANNEL = "@AniTime_here" 
 
-# Premium tariflar (Telegram Stars)
+# Admin tasdiqlaydigan Premium tariflar
 PREMIUM_PLANS = {
-    "1m": {"name": "1 oy", "days": 30, "price": 50},
-    "3m": {"name": "3 oy", "days": 90, "price": 75},
-    "6m": {"name": "6 oy", "days": 180, "price": 100},
-    "1y": {"name": "1 yil", "days": 365, "price": 125},
-    "vip": {"name": "VIP", "days": None, "price": 200},
+    "1m": {"name": "1 oy", "days": 30},
+    "3m": {"name": "3 oy", "days": 90},
+    "6m": {"name": "6 oy", "days": 180},
+    "1y": {"name": "1 yil", "days": 365},
+    "vip": {"name": "VIP", "days": None},
 }
 
-# Aniq savdo posti havolasini .env yoki Render Environment orqali kiriting.
-STARS_PURCHASE_URL = (
-    os.getenv("STARS_PURCHASE_URL") or "https://t.me/Dayleess_Donat/172"
-)
 PAY_SUPPORT_CONTACT = os.getenv("PAY_SUPPORT_CONTACT") or "@Dayleess_369"
 PAY_SUPPORT_URL = os.getenv("PAY_SUPPORT_URL") or "https://t.me/Dayleess_369"
 

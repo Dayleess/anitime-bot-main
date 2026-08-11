@@ -1,7 +1,9 @@
 import asyncio
+import html
 import logging
 import os
 from datetime import datetime, timezone
+from urllib.parse import quote
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
@@ -11,7 +13,6 @@ from aiogram.types import (
     BotCommand,
     BotCommandScopeChat,
     BotCommandScopeDefault,
-    LabeledPrice,
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -23,7 +24,6 @@ from config import (
     REQUIRED_CHANNELS,
     POST_CHANNEL,
     PREMIUM_PLANS,
-    STARS_PURCHASE_URL,
     PAY_SUPPORT_CONTACT,
     PAY_SUPPORT_URL,
 )
@@ -95,16 +95,14 @@ def subscription_keyboard(not_subscribed: list[dict], anime_id: int) -> InlineKe
 def premium_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="1 oy - 50 Stars", callback_data="buy_premium:1m"),
-            InlineKeyboardButton(text="3 oy - 75 Stars", callback_data="buy_premium:3m"),
+            InlineKeyboardButton(text="1 oy", callback_data="buy_premium:1m"),
+            InlineKeyboardButton(text="3 oy", callback_data="buy_premium:3m"),
         ],
         [
-            InlineKeyboardButton(text="6 oy - 100 Stars", callback_data="buy_premium:6m"),
-            InlineKeyboardButton(text="1 yil - 125 Stars", callback_data="buy_premium:1y"),
+            InlineKeyboardButton(text="6 oy", callback_data="buy_premium:6m"),
+            InlineKeyboardButton(text="1 yil", callback_data="buy_premium:1y"),
         ],
-        [InlineKeyboardButton(text="VIP umrbod - 200 Stars", callback_data="buy_premium:vip")],
-        [InlineKeyboardButton(text="Stars sotib olish", url=STARS_PURCHASE_URL)],
-        [InlineKeyboardButton(text="To'lov shartlari", callback_data="premium_terms")],
+        [InlineKeyboardButton(text="VIP umrbod", callback_data="buy_premium:vip")],
     ])
 
 def format_premium_status(status: dict) -> str:
@@ -123,13 +121,9 @@ async def send_premium_menu(user_id: int, premium_anime: str | None = None):
     await bot.send_message(
         user_id,
         f"{intro}<b>AniTime Premium</b>\n\n"
-        f"1 oy - 50 Stars\n"
-        f"3 oy - 75 Stars\n"
-        f"6 oy - 100 Stars\n"
-        f"1 yil - 125 Stars\n"
-        f"VIP umrbod - 200 Stars\n\n"
         f"{format_premium_status(status)}\n\n"
-        f"Sotib olish orqali /terms shartlarini qabul qilasiz.",
+        f"Kerakli tarifni tanlang. Bot adminga so'rov yuboradi, "
+        f"keyin to'lovni shaxsiy chatda kelishasiz.",
         reply_markup=premium_keyboard(),
         parse_mode="HTML",
     )
@@ -156,7 +150,7 @@ async def cmd_start(msg: types.Message, state: FSMContext):
     await msg.answer(
         "👋 Salom! Men <b>AniTime</b> botiman.\n\n"
         "📺 Kanal postidagi <b>Yuklab olish</b> tugmasini bosing va animelarni olish uchun foydalaning.\n\n"
-        "⭐ Premium tariflar uchun /premium buyrug'ini bosing.",
+        "⭐ Premium olish uchun /premium buyrug'ini bosing.",
         parse_mode="HTML"
     )
 
@@ -169,33 +163,14 @@ async def cmd_premium_status(msg: types.Message):
     status = db.get_premium_status(msg.from_user.id)
     await msg.answer(format_premium_status(status))
 
-@dp.message(Command("terms"))
-async def cmd_terms(msg: types.Message):
-    await msg.answer(
-        "<b>AniTime Premium to'lov shartlari</b>\n\n"
-        "- Tariflar bir martalik Telegram Stars to'lovi orqali olinadi.\n"
-        "- 1, 3, 6 va 12 oylik tariflar qolgan faol muddat ustiga qo'shiladi.\n"
-        "- VIP tarif muddatsiz Premium kirish beradi.\n"
-        "- To'lov faqat Telegram muvaffaqiyatli tasdiqlaganidan keyin faollashadi.\n"
-        f"- To'lov muammolari bo'yicha aloqa: {PAY_SUPPORT_CONTACT}\n\n"
-        "To'lov tugmasini bosish orqali ushbu shartlarga rozilik bildirasiz.",
-        parse_mode="HTML",
-    )
-
 @dp.message(Command("paysupport"))
 async def cmd_paysupport(msg: types.Message):
     await msg.answer(
-        f"To'lov bo'yicha yordam: {PAY_SUPPORT_CONTACT}\n"
-        "Murojaatda qaysi obunani olganingiz va to'lov sanasini yozing.",
+        f"Premium bo'yicha yordam: {PAY_SUPPORT_CONTACT}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Adminga yozish", url=PAY_SUPPORT_URL)]
         ]),
     )
-
-@dp.callback_query(F.data == "premium_terms")
-async def callback_premium_terms(call: CallbackQuery):
-    await cmd_terms(call.message)
-    await call.answer()
 
 @dp.callback_query(F.data.startswith("buy_premium:"))
 async def callback_buy_premium(call: CallbackQuery):
@@ -210,85 +185,126 @@ async def callback_buy_premium(call: CallbackQuery):
         await call.answer("Sizda umrbod VIP allaqachon faol.", show_alert=True)
         return
 
-    await bot.send_invoice(
-        chat_id=call.from_user.id,
-        title=f"AniTime Premium - {plan['name']}",
-        description=(
-            "AniTime Premium animelariga kirish. "
-            "To'lov bir martalik va tanlangan muddatga amal qiladi."
-        ),
-        payload=f"anitime_premium:{plan_code}",
-        currency="XTR",
-        prices=[LabeledPrice(label=plan["name"], amount=plan["price"])],
-    )
-    await call.answer()
-
-@dp.pre_checkout_query()
-async def process_pre_checkout(query: types.PreCheckoutQuery):
-    payload_prefix = "anitime_premium:"
-    plan_code = (
-        query.invoice_payload[len(payload_prefix):]
-        if query.invoice_payload.startswith(payload_prefix)
-        else ""
-    )
-    plan = PREMIUM_PLANS.get(plan_code)
-    valid_payment = bool(
-        plan
-        and query.currency == "XTR"
-        and query.total_amount == plan["price"]
-    )
-
-    await query.answer(
-        ok=valid_payment,
-        error_message=None if valid_payment else "Tarif ma'lumotlari mos kelmadi.",
-    )
-
-@dp.message(F.successful_payment)
-async def process_successful_payment(msg: types.Message):
-    payment = msg.successful_payment
-    payload_prefix = "anitime_premium:"
-    plan_code = (
-        payment.invoice_payload[len(payload_prefix):]
-        if payment.invoice_payload.startswith(payload_prefix)
-        else ""
-    )
-    plan = PREMIUM_PLANS.get(plan_code)
-    if not plan or payment.currency != "XTR" or payment.total_amount != plan["price"]:
-        logging.error("Noma'lum premium to'lovi: user_id=%s", msg.from_user.id)
-        await msg.answer(f"To'lovni tekshirishda xatolik. /paysupport: {PAY_SUPPORT_CONTACT}")
+    request = db.create_premium_request(call.from_user.id, plan_code)
+    request_plan = PREMIUM_PLANS.get(request["plan_code"])
+    if not request["created"]:
+        await call.answer(
+            f"Sizda #{request['id']} raqamli {request_plan['name']} so'rovi kutilmoqda.",
+            show_alert=True,
+        )
         return
 
-    try:
-        status = db.activate_premium(
-            user_id=msg.from_user.id,
-            plan_code=plan_code,
-            duration_days=plan["days"],
-            amount=payment.total_amount,
-            currency=payment.currency,
-            telegram_payment_charge_id=payment.telegram_payment_charge_id,
-            provider_payment_charge_id=payment.provider_payment_charge_id,
-        )
-    except Exception:
-        logging.exception("Premium to'lovini bazaga yozib bo'lmadi")
-        await msg.answer(
-            "To'lov qabul qilindi, lekin obunani faollashtirishda xatolik yuz berdi. "
-            f"Iltimos, /paysupport orqali {PAY_SUPPORT_CONTACT} bilan bog'laning."
-        )
-        for admin_id in ADMIN_IDS:
-            try:
-                await bot.send_message(
-                    admin_id,
-                    f"Premium to'lov bazaga yozilmadi. User ID: {msg.from_user.id}",
-                )
-            except Exception:
-                pass
-        return
+    request_id = request["id"]
+    username = f"@{call.from_user.username}" if call.from_user.username else "username yo'q"
+    user_name = html.escape(call.from_user.full_name)
+    admin_markup = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="✅ Premium berish",
+                callback_data=f"approve_premium:{request_id}",
+            ),
+            InlineKeyboardButton(
+                text="❌ Rad etish",
+                callback_data=f"reject_premium:{request_id}",
+            ),
+        ]
+    ])
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"🆕 <b>Premium so'rov #{request_id}</b>\n\n"
+                f"Foydalanuvchi: <b>{user_name}</b>\n"
+                f"Username: {username}\n"
+                f"User ID: <code>{call.from_user.id}</code>\n"
+                f"Tarif: <b>{plan['name']}</b>\n\n"
+                f"Pul kelganidan keyin Premium berish tugmasini bosing.",
+                reply_markup=admin_markup,
+                parse_mode="HTML",
+            )
+        except Exception:
+            logging.exception("Premium so'rovini adminga yuborib bo'lmadi")
 
-    await msg.answer(
-        f"To'lov muvaffaqiyatli. <b>{plan['name']}</b> tarifi faollashtirildi.\n\n"
-        f"{format_premium_status(status)}",
+    draft_text = quote(
+        f"Assalomu alaykum! Premium so'rov #{request_id}. Tarif: {plan['name']}",
+        safe="",
+    )
+    contact_url = f"{PAY_SUPPORT_URL}?text={draft_text}"
+    await call.message.answer(
+        f"✅ <b>So'rov #{request_id}</b> adminga yuborildi.\n"
+        f"Tanlangan tarif: <b>{plan['name']}</b>\n\n"
+        f"Quyidagi tugma orqali adminga yozing. So'rov matni tayyor turadi.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Adminga yozish", url=contact_url)]
+        ]),
         parse_mode="HTML",
     )
+    await call.answer("So'rov yuborildi")
+
+@dp.callback_query(F.data.startswith("approve_premium:"))
+async def callback_approve_premium(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Bu amal faqat admin uchun.", show_alert=True)
+        return
+
+    request_id = int(call.data.split(":", maxsplit=1)[1])
+    request = db.get_premium_request(request_id)
+    plan = PREMIUM_PLANS.get(request["plan_code"]) if request else None
+    if not request or not plan:
+        await call.answer("So'rov topilmadi.", show_alert=True)
+        return
+
+    result = db.approve_premium_request(request_id, call.from_user.id, plan["days"])
+    if not result:
+        await call.answer("Bu so'rov avval ko'rib chiqilgan.", show_alert=True)
+        return
+
+    await call.message.edit_text(
+        f"✅ <b>Premium so'rov #{request_id} tasdiqlandi</b>\n\n"
+        f"User ID: <code>{result['user_id']}</code>\n"
+        f"Tarif: <b>{plan['name']}</b>\n"
+        f"{format_premium_status(result)}",
+        parse_mode="HTML",
+    )
+    try:
+        await bot.send_message(
+            result["user_id"],
+            f"✅ Sizga <b>{plan['name']}</b> Premium berildi.\n\n"
+            f"{format_premium_status(result)}",
+            parse_mode="HTML",
+        )
+    except Exception:
+        logging.exception("Premium tasdiqini foydalanuvchiga yuborib bo'lmadi")
+    await call.answer("Premium faollashtirildi")
+
+@dp.callback_query(F.data.startswith("reject_premium:"))
+async def callback_reject_premium(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Bu amal faqat admin uchun.", show_alert=True)
+        return
+
+    request_id = int(call.data.split(":", maxsplit=1)[1])
+    result = db.reject_premium_request(request_id, call.from_user.id)
+    if not result:
+        await call.answer("Bu so'rov avval ko'rib chiqilgan.", show_alert=True)
+        return
+
+    plan = PREMIUM_PLANS.get(result["plan_code"])
+    await call.message.edit_text(
+        f"❌ <b>Premium so'rov #{request_id} rad etildi</b>\n\n"
+        f"User ID: <code>{result['user_id']}</code>\n"
+        f"Tarif: <b>{plan['name'] if plan else result['plan_code']}</b>",
+        parse_mode="HTML",
+    )
+    try:
+        await bot.send_message(
+            result["user_id"],
+            f"❌ Premium so'rov #{request_id} rad etildi. "
+            f"Batafsil ma'lumot uchun {PAY_SUPPORT_CONTACT} ga yozing.",
+        )
+    except Exception:
+        logging.exception("Rad etish xabarini foydalanuvchiga yuborib bo'lmadi")
+    await call.answer("So'rov rad etildi")
 
 async def send_anime_or_check_sub(user_id: int, anime_id: int, msg: types.Message):
     not_subscribed = await check_subscriptions(user_id)
@@ -547,6 +563,7 @@ async def cmd_help(msg: types.Message):
         "🛠 <b>Admin komandalari:</b>\n\n"
         "/list — barcha animelar, yangi qo'shish, epizod qo'shish\n"
         "/help — ushbu yordam\n\n"
+        "Premium so'rovlari sizga tasdiqlash tugmalari bilan avtomatik keladi.\n\n"
         "<b>🎬 List menusida:</b>\n"
         "➕ Yangi anime qo'shish\n"
         "➕ Epizod qo'shish\n"
@@ -750,19 +767,17 @@ async def set_commands():
     """Telegram pastki input qismida chiquvchi buyruqlar menyusi"""
     user_commands = [
         BotCommand(command="start", description="Botni ishga tushirish"),
-        BotCommand(command="premium", description="Premium tariflar"),
+        BotCommand(command="premium", description="Premium olish"),
         BotCommand(command="premium_status", description="Obuna holatini tekshirish"),
-        BotCommand(command="terms", description="To'lov shartlari"),
-        BotCommand(command="paysupport", description="To'lov bo'yicha yordam"),
+        BotCommand(command="paysupport", description="Premium bo'yicha yordam"),
     ]
     await bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
 
     admin_commands = [
         BotCommand(command="start",  description="Botni ishga tushirish"),
-        BotCommand(command="premium", description="Premium tariflar"),
+        BotCommand(command="premium", description="Premium olish"),
         BotCommand(command="premium_status", description="Obuna holatini tekshirish"),
-        BotCommand(command="terms", description="To'lov shartlari"),
-        BotCommand(command="paysupport", description="To'lov bo'yicha yordam"),
+        BotCommand(command="paysupport", description="Premium bo'yicha yordam"),
         BotCommand(command="list",   description="📋 Barcha animelar menus"),
         BotCommand(command="help",   description="🛠 Yordam"),
     ]

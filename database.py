@@ -61,16 +61,19 @@ def init_db():
             );
         """)
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS premium_payments (
-                id                         SERIAL PRIMARY KEY,
-                user_id                    BIGINT NOT NULL,
-                plan_code                  TEXT NOT NULL,
-                amount                     INTEGER NOT NULL,
-                currency                   TEXT NOT NULL,
-                telegram_payment_charge_id TEXT NOT NULL UNIQUE,
-                provider_payment_charge_id TEXT,
-                created_at                 TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            CREATE TABLE IF NOT EXISTS premium_requests (
+                id          SERIAL PRIMARY KEY,
+                user_id     BIGINT NOT NULL,
+                plan_code   TEXT NOT NULL,
+                status      TEXT NOT NULL DEFAULT 'pending',
+                resolved_by BIGINT,
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                resolved_at TIMESTAMP
             );
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_premium_requests_user_status
+            ON premium_requests (user_id, status);
         """)
     else:
         # SQLite
@@ -106,16 +109,18 @@ def init_db():
                 updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
             );
 
-            CREATE TABLE IF NOT EXISTS premium_payments (
+            CREATE TABLE IF NOT EXISTS premium_requests (
                 id                         INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id                    INTEGER NOT NULL,
                 plan_code                  TEXT NOT NULL,
-                amount                     INTEGER NOT NULL,
-                currency                   TEXT NOT NULL,
-                telegram_payment_charge_id TEXT NOT NULL UNIQUE,
-                provider_payment_charge_id TEXT,
-                created_at                 DATETIME DEFAULT CURRENT_TIMESTAMP
+                status                     TEXT NOT NULL DEFAULT 'pending',
+                resolved_by                INTEGER,
+                created_at                 DATETIME DEFAULT CURRENT_TIMESTAMP,
+                resolved_at                DATETIME
             );
+
+            CREATE INDEX IF NOT EXISTS idx_premium_requests_user_status
+            ON premium_requests (user_id, status);
         """)
     conn.commit()
     conn.close()
@@ -304,63 +309,94 @@ def get_premium_status(user_id: int) -> dict:
         "expires_at": int(expires_at) if expires_at is not None else None,
     }
 
-def activate_premium(
-    user_id: int,
-    plan_code: str,
-    duration_days: int | None,
-    amount: int,
-    currency: str,
-    telegram_payment_charge_id: str,
-    provider_payment_charge_id: str = "",
-) -> dict:
-    """To'lovni bir marta yozadi va premium muddatini uzaytiradi."""
+def create_premium_request(user_id: int, plan_code: str) -> dict:
     conn = get_connection()
     cur = conn.cursor()
     is_postgres = bool(DATABASE_URL and PSCOPG2_AVAILABLE)
 
     if is_postgres:
-        # Bir foydalanuvchining bir vaqtdagi to'lovlari muddatni yo'qotib qo'ymasligi uchun.
         cur.execute("SELECT pg_advisory_xact_lock(%s)", (user_id,))
         cur.execute(
-            """
-            INSERT INTO premium_payments (
-                user_id, plan_code, amount, currency,
-                telegram_payment_charge_id, provider_payment_charge_id
-            ) VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (telegram_payment_charge_id) DO NOTHING
-            """,
-            (
-                user_id,
-                plan_code,
-                amount,
-                currency,
-                telegram_payment_charge_id,
-                provider_payment_charge_id,
-            ),
+            """SELECT id, plan_code FROM premium_requests
+               WHERE user_id = %s AND status = 'pending'
+               ORDER BY id DESC LIMIT 1""",
+            (user_id,),
         )
     else:
+        cur.execute("BEGIN IMMEDIATE")
         cur.execute(
-            """
-            INSERT OR IGNORE INTO premium_payments (
-                user_id, plan_code, amount, currency,
-                telegram_payment_charge_id, provider_payment_charge_id
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                user_id,
-                plan_code,
-                amount,
-                currency,
-                telegram_payment_charge_id,
-                provider_payment_charge_id,
-            ),
+            """SELECT id, plan_code FROM premium_requests
+               WHERE user_id = ? AND status = 'pending'
+               ORDER BY id DESC LIMIT 1""",
+            (user_id,),
         )
 
-    if cur.rowcount == 0:
+    existing = cur.fetchone()
+    if existing:
+        request_id, existing_plan = existing[0], existing[1]
+        conn.commit()
         conn.close()
-        return get_premium_status(user_id)
+        return {"id": request_id, "plan_code": existing_plan, "created": False}
 
     if is_postgres:
+        cur.execute(
+            "INSERT INTO premium_requests (user_id, plan_code) VALUES (%s, %s) RETURNING id",
+            (user_id, plan_code),
+        )
+        request_id = cur.fetchone()[0]
+    else:
+        cur.execute(
+            "INSERT INTO premium_requests (user_id, plan_code) VALUES (?, ?)",
+            (user_id, plan_code),
+        )
+        request_id = cur.lastrowid
+
+    conn.commit()
+    conn.close()
+    return {"id": request_id, "plan_code": plan_code, "created": True}
+
+def get_premium_request(request_id: int) -> dict | None:
+    conn = get_connection()
+    if DATABASE_URL and PSCOPG2_AVAILABLE:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT * FROM premium_requests WHERE id = %s", (request_id,))
+    else:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM premium_requests WHERE id = ?", (request_id,))
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def approve_premium_request(
+    request_id: int,
+    admin_id: int,
+    duration_days: int | None,
+) -> dict | None:
+    conn = get_connection()
+    cur = conn.cursor()
+    is_postgres = bool(DATABASE_URL and PSCOPG2_AVAILABLE)
+
+    if is_postgres:
+        cur.execute(
+            "SELECT user_id, plan_code, status FROM premium_requests WHERE id = %s FOR UPDATE",
+            (request_id,),
+        )
+    else:
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute(
+            "SELECT user_id, plan_code, status FROM premium_requests WHERE id = ?",
+            (request_id,),
+        )
+
+    request_row = cur.fetchone()
+    if not request_row or request_row[2] != "pending":
+        conn.commit()
+        conn.close()
+        return None
+
+    user_id, plan_code = int(request_row[0]), request_row[1]
+    if is_postgres:
+        cur.execute("SELECT pg_advisory_xact_lock(%s)", (user_id,))
         cur.execute(
             "SELECT expires_at, is_vip FROM premium_subscriptions WHERE user_id = %s FOR UPDATE",
             (user_id,),
@@ -370,11 +406,13 @@ def activate_premium(
             "SELECT expires_at, is_vip FROM premium_subscriptions WHERE user_id = ?",
             (user_id,),
         )
+
     current_row = cur.fetchone()
-    if current_row and is_postgres:
-        current = {"expires_at": current_row[0], "is_vip": current_row[1]}
-    else:
-        current = dict(current_row) if current_row else None
+    current = (
+        {"expires_at": current_row[0], "is_vip": current_row[1]}
+        if current_row
+        else None
+    )
 
     now = int(time.time())
     already_vip = bool(current and current["is_vip"])
@@ -411,6 +449,61 @@ def activate_premium(
             (user_id, expires_at, int(is_vip)),
         )
 
+    if is_postgres:
+        cur.execute(
+            """UPDATE premium_requests
+               SET status = 'approved', resolved_by = %s, resolved_at = CURRENT_TIMESTAMP
+               WHERE id = %s""",
+            (admin_id, request_id),
+        )
+    else:
+        cur.execute(
+            """UPDATE premium_requests
+               SET status = 'approved', resolved_by = ?, resolved_at = CURRENT_TIMESTAMP
+               WHERE id = ?""",
+            (admin_id, request_id),
+        )
+
     conn.commit()
     conn.close()
-    return {"active": True, "is_vip": is_vip, "expires_at": expires_at}
+    return {
+        "user_id": user_id,
+        "plan_code": plan_code,
+        "active": True,
+        "is_vip": is_vip,
+        "expires_at": expires_at,
+    }
+
+def reject_premium_request(request_id: int, admin_id: int) -> dict | None:
+    conn = get_connection()
+    cur = conn.cursor()
+    if DATABASE_URL and PSCOPG2_AVAILABLE:
+        cur.execute(
+            """UPDATE premium_requests
+               SET status = 'rejected', resolved_by = %s, resolved_at = CURRENT_TIMESTAMP
+               WHERE id = %s AND status = 'pending'
+               RETURNING user_id, plan_code""",
+            (admin_id, request_id),
+        )
+    else:
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute(
+            "SELECT user_id, plan_code FROM premium_requests WHERE id = ? AND status = 'pending'",
+            (request_id,),
+        )
+        pending = cur.fetchone()
+        if pending:
+            cur.execute(
+                """UPDATE premium_requests
+                   SET status = 'rejected', resolved_by = ?, resolved_at = CURRENT_TIMESTAMP
+                   WHERE id = ?""",
+                (admin_id, request_id),
+            )
+
+    if DATABASE_URL and PSCOPG2_AVAILABLE:
+        row = cur.fetchone()
+    else:
+        row = pending
+    conn.commit()
+    conn.close()
+    return {"user_id": int(row[0]), "plan_code": row[1]} if row else None
