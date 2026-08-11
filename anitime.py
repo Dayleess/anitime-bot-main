@@ -114,6 +114,15 @@ def format_premium_status(status: dict) -> str:
     return "Sizda hozir faol Premium obuna yo'q."
 
 async def send_premium_menu(user_id: int, premium_anime: str | None = None):
+    if is_admin(user_id):
+        await bot.send_message(
+            user_id,
+            "<b>Siz bot adminisiz.</b>\n\n"
+            "Barcha Premium animelar siz uchun doim ochiq.",
+            parse_mode="HTML",
+        )
+        return
+
     status = db.get_premium_status(user_id)
     intro = ""
     if premium_anime:
@@ -160,6 +169,12 @@ async def cmd_premium(msg: types.Message):
 
 @dp.message(Command("premium_status"))
 async def cmd_premium_status(msg: types.Message):
+    if is_admin(msg.from_user.id):
+        await msg.answer(
+            "Siz bot adminisiz. Barcha Premium animelar siz uchun doim ochiq."
+        )
+        return
+
     status = db.get_premium_status(msg.from_user.id)
     await msg.answer(format_premium_status(status))
 
@@ -174,6 +189,13 @@ async def cmd_paysupport(msg: types.Message):
 
 @dp.callback_query(F.data.startswith("buy_premium:"))
 async def callback_buy_premium(call: CallbackQuery):
+    if is_admin(call.from_user.id):
+        await call.answer(
+            "Siz bot adminisiz. Premium siz uchun doim ochiq.",
+            show_alert=True,
+        )
+        return
+
     plan_code = call.data.split(":", maxsplit=1)[1]
     plan = PREMIUM_PLANS.get(plan_code)
     if not plan:
