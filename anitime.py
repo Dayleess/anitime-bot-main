@@ -438,6 +438,9 @@ async def deliver_anime(user_id: int, anime_id: int, msg: types.Message):
 
 @dp.callback_query(F.data == "add_anime_btn")
 async def callback_add_anime(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("Bu amal faqat admin uchun.", show_alert=True)
+        return
     await state.set_state(AddAnimeState.waiting_title)
     await call.message.edit_text("🎬 Anime nomini yozing:")
     await call.answer()
@@ -495,18 +498,26 @@ async def addanime_photo_skip(msg: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("add_episode:"))
 async def callback_add_episode(call: CallbackQuery, state: FSMContext):
-    anime_id = int(call.data.split(":")[1])
+    if not is_admin(call.from_user.id):
+        await call.answer("Bu amal faqat admin uchun.", show_alert=True)
+        return
+    parts = call.data.split(":")
+    anime_id = int(parts[1])
+    page = int(parts[2]) if len(parts) > 2 else 0
     anime = db.get_anime(anime_id)
     
     if not anime:
         await call.answer("❌ Anime topilmadi!", show_alert=True)
         return
     
-    await state.update_data(anime_id=anime_id)
+    await state.update_data(anime_id=anime_id, return_page=page)
     await state.set_state(AddEpisodeState.waiting_season)
     
     back_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="↩️ Orqaga", callback_data="back_to_list")]
+        [InlineKeyboardButton(
+            text="⬅️ Orqaga",
+            callback_data=f"back_to_anime:{anime_id}:{page}",
+        )]
     ])
     
     await call.message.edit_text(
@@ -558,42 +569,115 @@ async def addepisode_not_video(msg: types.Message):
 
 # ─── Admin: List va Control ───────────────────────────────────────────────────
 
-async def show_list(user_id: int, msg_or_call):
-    """List menyu ko'rsatish"""
+ANIME_LIST_PAGE_SIZE = 8
+
+async def show_list(user_id: int, msg_or_call, page: int = 0):
+    """Ixcham va sahifalangan anime ro'yxatini ko'rsatish."""
     animes = db.list_animes_with_episode_counts()
-    text = "📋 <b>Barcha animelar:</b>\n\n"
+    total_pages = max(1, (len(animes) + ANIME_LIST_PAGE_SIZE - 1) // ANIME_LIST_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * ANIME_LIST_PAGE_SIZE
+    page_animes = animes[start:start + ANIME_LIST_PAGE_SIZE]
+    premium_count = sum(bool(anime["is_premium"]) for anime in animes)
+
+    text = (
+        "🎬 <b>Anime boshqaruvi</b>\n\n"
+        f"Jami: <b>{len(animes)}</b>  |  "
+        f"⭐ Premium: <b>{premium_count}</b>  |  "
+        f"🆓 Bepul: <b>{len(animes) - premium_count}</b>\n"
+    )
     buttons = []
-    
-    if animes:
-        for a in animes:
-            access = "⭐ Premium" if a["is_premium"] else "🆓 Bepul"
-            text += f"🆔 {a['id']} | 🎬 {a['title']} ({a['episode_count']} ta epizod) | {access}\n"
-            buttons.append([
-                InlineKeyboardButton(text=f"➕ Epizod", callback_data=f"add_episode:{a['id']}"),
-                InlineKeyboardButton(text=f"✏️ Edit", callback_data=f"edit_anime:{a['id']}"),
-                InlineKeyboardButton(text=f"🗑️ O'chirish", callback_data=f"delete_anime:{a['id']}")
-            ])
+
+    if page_animes:
+        text += f"Sahifa: <b>{page + 1}/{total_pages}</b>\n\nBoshqarish uchun anime tanlang:"
+        for anime in page_animes:
+            access_icon = "⭐" if anime["is_premium"] else "🆓"
             buttons.append([
                 InlineKeyboardButton(
-                    text="🆓 Bepul qilish" if a["is_premium"] else "⭐ Premium qilish",
-                    callback_data=f"toggle_premium:{a['id']}"
-                ),
-                InlineKeyboardButton(text=f"📢 {a['title']} -> Kanal", callback_data=f"post_confirm:{a['id']}")
+                    text=(
+                        f"{access_icon} {anime['id']}. {anime['title']} "
+                        f"| {anime['episode_count']} qism"
+                    ),
+                    callback_data=f"manage_anime:{anime['id']}:{page}",
+                )
             ])
     else:
-        text += "Hali anime qo'shilmagan.\n"
-    
+        text += "\nHali anime qo'shilmagan."
+
+    if total_pages > 1:
+        navigation = []
+        if page > 0:
+            navigation.append(
+                InlineKeyboardButton(text="⬅️", callback_data=f"list_page:{page - 1}")
+            )
+        navigation.append(
+            InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="list_noop")
+        )
+        if page < total_pages - 1:
+            navigation.append(
+                InlineKeyboardButton(text="➡️", callback_data=f"list_page:{page + 1}")
+            )
+        buttons.append(navigation)
+
     buttons.append([
         InlineKeyboardButton(text="➕ Yangi anime qo'shish", callback_data="add_anime_btn")
     ])
-    
+
     markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-    
+
     if isinstance(msg_or_call, types.Message):
         await msg_or_call.answer(text, reply_markup=markup, parse_mode="HTML")
     else:
         await msg_or_call.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
         await msg_or_call.answer()
+
+async def show_anime_management(call: CallbackQuery, anime_id: int, page: int = 0):
+    anime = db.get_anime(anime_id)
+    if not anime:
+        await call.answer("Anime topilmadi.", show_alert=True)
+        return False
+
+    episode_count = db.get_episode_count(anime_id)
+    access = "⭐ Premium" if anime.get("is_premium") else "🆓 Bepul"
+    poster = "✅ Bor" if anime.get("photo_file_id") else "➖ Yo'q"
+    title = html.escape(anime["title"])
+    text = (
+        f"🎬 <b>{title}</b>\n\n"
+        f"🆔 ID: <code>{anime_id}</code>\n"
+        f"🎞 Qismlar: <b>{episode_count}</b>\n"
+        f"🔐 Holat: <b>{access}</b>\n"
+        f"🖼 Poster: <b>{poster}</b>\n\n"
+        "Kerakli amalni tanlang:"
+    )
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="➕ Epizod",
+                callback_data=f"add_episode:{anime_id}:{page}",
+            ),
+            InlineKeyboardButton(
+                text="✏️ Tahrirlash",
+                callback_data=f"edit_anime:{anime_id}:{page}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="🆓 Bepul qilish" if anime.get("is_premium") else "⭐ Premium qilish",
+                callback_data=f"toggle_premium:{anime_id}:{page}",
+            ),
+            InlineKeyboardButton(
+                text="📢 Kanalga",
+                callback_data=f"post_confirm:{anime_id}:{page}",
+            ),
+        ],
+        [InlineKeyboardButton(
+            text="🗑 O'chirish",
+            callback_data=f"delete_anime:{anime_id}:{page}",
+        )],
+        [InlineKeyboardButton(text="⬅️ Ro'yxatga", callback_data=f"list_page:{page}")],
+    ])
+    await call.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    return True
 
 @dp.message(Command("list"))
 async def cmd_list(msg: types.Message):
@@ -603,8 +687,47 @@ async def cmd_list(msg: types.Message):
 
 @dp.callback_query(F.data == "back_to_list")
 async def callback_back_to_list(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("Bu amal faqat admin uchun.", show_alert=True)
+        return
     await state.clear()
     await show_list(call.from_user.id, call)
+
+@dp.callback_query(F.data.startswith("list_page:"))
+async def callback_list_page(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("Bu amal faqat admin uchun.", show_alert=True)
+        return
+    await state.clear()
+    page = int(call.data.split(":", maxsplit=1)[1])
+    await show_list(call.from_user.id, call, page)
+
+@dp.callback_query(F.data == "list_noop")
+async def callback_list_noop(call: CallbackQuery):
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("manage_anime:"))
+async def callback_manage_anime(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Bu amal faqat admin uchun.", show_alert=True)
+        return
+    parts = call.data.split(":")
+    anime_id = int(parts[1])
+    page = int(parts[2]) if len(parts) > 2 else 0
+    if await show_anime_management(call, anime_id, page):
+        await call.answer()
+
+@dp.callback_query(F.data.startswith("back_to_anime:"))
+async def callback_back_to_anime(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("Bu amal faqat admin uchun.", show_alert=True)
+        return
+    await state.clear()
+    parts = call.data.split(":")
+    anime_id = int(parts[1])
+    page = int(parts[2]) if len(parts) > 2 else 0
+    if await show_anime_management(call, anime_id, page):
+        await call.answer()
 
 @dp.callback_query(F.data.startswith("toggle_premium:"))
 async def callback_toggle_premium(call: CallbackQuery):
@@ -612,14 +735,17 @@ async def callback_toggle_premium(call: CallbackQuery):
         await call.answer("Bu amal faqat admin uchun.", show_alert=True)
         return
 
-    anime_id = int(call.data.split(":", maxsplit=1)[1])
+    parts = call.data.split(":")
+    anime_id = int(parts[1])
+    page = int(parts[2]) if len(parts) > 2 else 0
     anime = db.get_anime(anime_id)
     if not anime:
         await call.answer("Anime topilmadi.", show_alert=True)
         return
 
     db.set_anime_premium(anime_id, not bool(anime.get("is_premium")))
-    await show_list(call.from_user.id, call)
+    await show_anime_management(call, anime_id, page)
+    await call.answer("Anime holati yangilandi.")
 
 @dp.message(Command("help"))
 async def cmd_help(msg: types.Message):
@@ -661,22 +787,62 @@ async def cmd_help(msg: types.Message):
 
 @dp.callback_query(F.data.startswith("post_confirm:"))
 async def callback_post_confirm(call: CallbackQuery):
-    anime_id = int(call.data.split(":")[1])
-    await share_to_channel(call.from_user.id, anime_id)
-    await call.answer("Kanalga yuborildi!")
+    if not is_admin(call.from_user.id):
+        await call.answer("Bu amal faqat admin uchun.", show_alert=True)
+        return
+    parts = call.data.split(":")
+    anime_id = int(parts[1])
+    page = int(parts[2]) if len(parts) > 2 else 0
+    anime = db.get_anime(anime_id)
+    if not anime:
+        await call.answer("Anime topilmadi.", show_alert=True)
+        return
+
+    await call.message.edit_text(
+        f"📢 <b>{html.escape(anime['title'])}</b> ni kanalga joylaysizmi?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="✅ Kanalga joylash",
+                callback_data=f"post_anime:{anime_id}:{page}",
+            )],
+            [InlineKeyboardButton(
+                text="⬅️ Bekor qilish",
+                callback_data=f"manage_anime:{anime_id}:{page}",
+            )],
+        ]),
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("post_anime:"))
+async def callback_post_anime(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Bu amal faqat admin uchun.", show_alert=True)
+        return
+    parts = call.data.split(":")
+    anime_id = int(parts[1])
+    page = int(parts[2]) if len(parts) > 2 else 0
+    posted = await share_to_channel(call.from_user.id, anime_id)
+    if posted:
+        await show_anime_management(call, anime_id, page)
+        await call.answer("Kanalga joylandi.")
+    else:
+        await call.answer("Kanalga joylashda xatolik yuz berdi.", show_alert=True)
 
 async def share_to_channel(admin_id: int, anime_id: int):
     anime = db.get_anime(anime_id)
     if not anime:
         await bot.send_message(admin_id, "❌ Anime topilmadi.")
-        return
+        return False
 
     bot_info = await bot.get_me()
     link = f"https://t.me/{bot_info.username}?start=anime_{anime_id}"
+    title = html.escape(anime["title"])
+    description = html.escape(anime.get("description") or "")
     
     text = (
-        f"🎬 <b>{anime['title']}</b>\n\n"
-        f"{anime['description']}\n\n"
+        f"🎬 <b>{title}</b>\n\n"
+        f"{description}\n\n"
         f"{'⭐ Premium anime' if anime.get('is_premium') else '🆓 Bepul anime'}\n\n"
         f"📥 Animeni ko'rish uchun quyidagi tugmani bosing:"
     )
@@ -701,15 +867,21 @@ async def share_to_channel(admin_id: int, anime_id: int):
                 reply_markup=keyboard,
                 parse_mode="HTML"
             )
-        await bot.send_message(admin_id, f"✅ <b>{anime['title']}</b> kanalga joylandi!")
+        return True
     except Exception as e:
         await bot.send_message(admin_id, f"❌ Kanalga joylashda xatolik: {str(e)}")
+        return False
 
 # ─── Admin: O'chirish (Delete) ───────────────────────────────────────────────
 
 @dp.callback_query(F.data.startswith("delete_anime:"))
 async def callback_delete_anime(call: CallbackQuery):
-    anime_id = int(call.data.split(":")[1])
+    if not is_admin(call.from_user.id):
+        await call.answer("Bu amal faqat admin uchun.", show_alert=True)
+        return
+    parts = call.data.split(":")
+    anime_id = int(parts[1])
+    page = int(parts[2]) if len(parts) > 2 else 0
     anime = db.get_anime(anime_id)
     
     if not anime:
@@ -718,13 +890,20 @@ async def callback_delete_anime(call: CallbackQuery):
     
     confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="✅ Albatta o'chirish", callback_data=f"confirm_delete:{anime_id}"),
-            InlineKeyboardButton(text="❌ Bekor qilish", callback_data=f"cancel_delete:{anime_id}")
+            InlineKeyboardButton(
+                text="✅ Ha, o'chirish",
+                callback_data=f"confirm_delete:{anime_id}:{page}",
+            ),
+            InlineKeyboardButton(
+                text="❌ Bekor qilish",
+                callback_data=f"cancel_delete:{anime_id}:{page}",
+            ),
         ]
     ])
     
     await call.message.edit_text(
-        f"⚠️ <b>{anime['title']}</b> ni haqiqatan ham o'chirib tashlamoqchisiz?\n"
+        f"⚠️ <b>{html.escape(anime['title'])}</b> ni haqiqatan ham "
+        "o'chirib tashlamoqchisiz?\n"
         f"Bu amalni qaytarib bo'lmaydi!",
         reply_markup=confirm_kb,
         parse_mode="HTML"
@@ -733,33 +912,62 @@ async def callback_delete_anime(call: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("confirm_delete:"))
 async def callback_confirm_delete(call: CallbackQuery):
-    anime_id = int(call.data.split(":")[1])
+    if not is_admin(call.from_user.id):
+        await call.answer("Bu amal faqat admin uchun.", show_alert=True)
+        return
+    parts = call.data.split(":")
+    anime_id = int(parts[1])
+    page = int(parts[2]) if len(parts) > 2 else 0
     anime = db.get_anime(anime_id)
-    
+    if not anime:
+        await call.answer("Anime topilmadi.", show_alert=True)
+        return
+
     db.delete_anime(anime_id)
-    await call.message.edit_text(f"🗑️ <b>{anime['title']}</b> o'chirib tashlandi!", parse_mode="HTML")
+    await call.message.edit_text(
+        f"🗑 <b>{html.escape(anime['title'])}</b> o'chirib tashlandi.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Ro'yxatga", callback_data=f"list_page:{page}")]
+        ]),
+        parse_mode="HTML",
+    )
     await call.answer("✅ Anime o'chirib tashlandi!")
 
 @dp.callback_query(F.data.startswith("cancel_delete:"))
 async def callback_cancel_delete(call: CallbackQuery):
-    await show_list(call.from_user.id, call)
+    if not is_admin(call.from_user.id):
+        await call.answer("Bu amal faqat admin uchun.", show_alert=True)
+        return
+    parts = call.data.split(":")
+    anime_id = int(parts[1])
+    page = int(parts[2]) if len(parts) > 2 else 0
+    if await show_anime_management(call, anime_id, page):
+        await call.answer()
 
 # ─── Admin: Tahrirlash (Edit) ────────────────────────────────────────────────
 
 @dp.callback_query(F.data.startswith("edit_anime:"))
 async def callback_edit_anime(call: CallbackQuery, state: FSMContext):
-    anime_id = int(call.data.split(":")[1])
+    if not is_admin(call.from_user.id):
+        await call.answer("Bu amal faqat admin uchun.", show_alert=True)
+        return
+    parts = call.data.split(":")
+    anime_id = int(parts[1])
+    page = int(parts[2]) if len(parts) > 2 else 0
     anime = db.get_anime(anime_id)
     
     if not anime:
         await call.answer("❌ Anime topilmadi!", show_alert=True)
         return
     
-    await state.update_data(edit_anime_id=anime_id)
+    await state.update_data(edit_anime_id=anime_id, return_page=page)
     await state.set_state(EditAnimeState.waiting_title)
     
     edit_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="↩️ Foydalanishdan voz kechish", callback_data="cancel_edit")]
+        [InlineKeyboardButton(
+            text="⬅️ Bekor qilish",
+            callback_data=f"back_to_anime:{anime_id}:{page}",
+        )]
     ])
     
     await call.message.edit_text(

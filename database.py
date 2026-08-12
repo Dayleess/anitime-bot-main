@@ -199,6 +199,17 @@ def get_episodes(anime_id: int) -> list[dict]:
     conn.close()
     return [dict(r) for r in rows]
 
+def get_episode_count(anime_id: int) -> int:
+    conn = get_connection()
+    cur = conn.cursor()
+    if DATABASE_URL and PSCOPG2_AVAILABLE:
+        cur.execute("SELECT COUNT(*) FROM episodes WHERE anime_id = %s", (anime_id,))
+    else:
+        cur.execute("SELECT COUNT(*) FROM episodes WHERE anime_id = ?", (anime_id,))
+    count = int(cur.fetchone()[0])
+    conn.close()
+    return count
+
 def list_animes() -> list[dict]:
     conn = get_connection()
     if DATABASE_URL and PSCOPG2_AVAILABLE:
