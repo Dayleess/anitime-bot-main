@@ -59,6 +59,11 @@ class AddEpisodeState(StatesGroup):
     waiting_episode = State()
     waiting_video = State()
 
+class BulkEpisodeState(StatesGroup):
+    waiting_season = State()
+    waiting_start = State()
+    waiting_videos = State()
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def is_admin(user_id: int) -> bool:
@@ -567,6 +572,136 @@ async def addepisode_video(msg: types.Message, state: FSMContext):
 async def addepisode_not_video(msg: types.Message):
     await msg.answer("❌ Iltimos, video faylni yuboring!")
 
+# ─── Admin: Ko'p qismli (Bulk) epizod yuklash ────────────────────────────────
+
+@dp.callback_query(F.data.startswith("bulk_episodes:"))
+async def callback_bulk_episodes(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("Bu amal faqat admin uchun.", show_alert=True)
+        return
+    parts = call.data.split(":")
+    anime_id = int(parts[1])
+    page = int(parts[2]) if len(parts) > 2 else 0
+    anime = db.get_anime(anime_id)
+    if not anime:
+        await call.answer("❌ Anime topilmadi!", show_alert=True)
+        return
+
+    await state.update_data(anime_id=anime_id, return_page=page, added=0)
+    await state.set_state(BulkEpisodeState.waiting_season)
+
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="⬅️ Orqaga",
+            callback_data=f"back_to_anime:{anime_id}:{page}",
+        )]
+    ])
+    await call.message.edit_text(
+        f"📦 <b>{html.escape(anime['title'])}</b> — ko'p qismli yuklash\n\n"
+        f"📁 Fasl raqamini yozing (masalan: 1):",
+        reply_markup=back_kb,
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+@dp.message(BulkEpisodeState.waiting_season)
+async def bulk_season(msg: types.Message, state: FSMContext):
+    try:
+        season = int(msg.text)
+    except (ValueError, AttributeError):
+        await msg.answer("❌ Fasl raqamini son bilan kiriting (masalan: 1):")
+        return
+    await state.update_data(season=season)
+    await state.set_state(BulkEpisodeState.waiting_start)
+    await msg.answer("🔢 Boshlang'ich qism raqamini yozing (masalan: 1):")
+
+@dp.message(BulkEpisodeState.waiting_start)
+async def bulk_start(msg: types.Message, state: FSMContext):
+    try:
+        start = int(msg.text)
+    except (ValueError, AttributeError):
+        await msg.answer("❌ Qism raqamini son bilan kiriting (masalan: 1):")
+        return
+    data = await state.get_data()
+    await state.update_data(next_episode=start)
+    await state.set_state(BulkEpisodeState.waiting_videos)
+    anime = db.get_anime(data["anime_id"])
+    await msg.answer(
+        f"📥 <b>{html.escape(anime['title'])}</b> | {data['season']}-Fasl — "
+        f"{start}-qismdan boshlab ketma-ket raqamlanadi.\n\n"
+        "Endi videolarni yuboraveringsiz (bir seansda 10 tagacha album bo'lishi ham "
+        "mumkin).\n\n"
+        "✅ <b>/done</b> — yuklashni tugatish\n"
+        "⏭ <b>/skip</b> — bitta qism raqamini o'tkazib yuborish\n"
+        "❌ <b>/cancel</b> — bekor qilish",
+        parse_mode="HTML",
+    )
+
+@dp.message(BulkEpisodeState.waiting_videos, F.video)
+async def bulk_video(msg: types.Message, state: FSMContext):
+    data = await state.get_data()
+    episode = data["next_episode"]
+    db.add_episode(data["anime_id"], data["season"], episode, msg.video.file_id)
+    added = data.get("added", 0) + 1
+    await state.update_data(next_episode=episode + 1, added=added)
+    anime = db.get_anime(data["anime_id"])
+    await msg.answer(
+        f"✅ {anime['title']} | {data['season']}-Fasl {episode}-qism saqlandi "
+        f"(jami: {added}). Keyingisi: {episode + 1}-qism.",
+    )
+
+@dp.message(BulkEpisodeState.waiting_videos, F.text)
+async def bulk_control(msg: types.Message, state: FSMContext):
+    data = await state.get_data()
+    text = (msg.text or "").split("@")[0].lower()
+
+    if text == "/skip":
+        skipped = data["next_episode"]
+        await state.update_data(next_episode=skipped + 1)
+        await msg.answer(f"⏭ {skipped}-qism o'tkazib yuborildi. Keyingi: {skipped + 1}.")
+        return
+
+    if text in ("/done", "/finish"):
+        anime = db.get_anime(data["anime_id"])
+        episodes_total = db.get_episode_count(data["anime_id"])
+        await state.clear()
+        await msg.answer(
+            f"🎉 Bulk yuklash tugatildi!\n\n"
+            f"📌 <b>{html.escape(anime['title'])}</b> | {data['season']}-Fasl\n"
+            f"➕ Qo'shildi: <b>{data.get('added', 0)}</b> ta qism\n"
+            f"🎞 Jami qismlar: <b>{episodes_total}</b>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="⬅️ Anime menyusi",
+                    callback_data=f"back_to_anime:{data['anime_id']}:{data.get('return_page', 0)}",
+                )]
+            ]),
+            parse_mode="HTML",
+        )
+        return
+
+    if text == "/cancel":
+        await state.clear()
+        await msg.answer(
+            "❌ Bulk yuklash bekor qilindi.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📋 Ro'yxat", callback_data="list_page:0")]
+            ]),
+        )
+        return
+
+    if text == "/list":
+        await state.clear()
+        return await cmd_list(msg)
+
+    await msg.answer(
+        "🎬 Videolarni yuboring, yoki: /done (tugatish), /skip (raqamni o'tkazish), /cancel"
+    )
+
+@dp.message(BulkEpisodeState.waiting_videos)
+async def bulk_other(msg: types.Message):
+    await msg.answer("❌ Faqat video fayl yuboring (yoki /done, /skip, /cancel).")
+
 # ─── Admin: List va Control ───────────────────────────────────────────────────
 
 ANIME_LIST_PAGE_SIZE = 8
@@ -670,10 +805,16 @@ async def show_anime_management(call: CallbackQuery, anime_id: int, page: int = 
                 callback_data=f"post_confirm:{anime_id}:{page}",
             ),
         ],
-        [InlineKeyboardButton(
-            text="🗑 O'chirish",
-            callback_data=f"delete_anime:{anime_id}:{page}",
-        )],
+        [
+            InlineKeyboardButton(
+                text="📦 Ko'p qism yuklash",
+                callback_data=f"bulk_episodes:{anime_id}:{page}",
+            ),
+            InlineKeyboardButton(
+                text="🗑 O'chirish",
+                callback_data=f"delete_anime:{anime_id}:{page}",
+            ),
+        ],
         [InlineKeyboardButton(text="⬅️ Ro'yxatga", callback_data=f"list_page:{page}")],
     ])
     await call.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
@@ -775,6 +916,7 @@ async def cmd_help(msg: types.Message):
             "<b>List menyusida:</b>\n"
             "Yangi anime qo'shish\n"
             "Epizod qo'shish\n"
+            "📦 Ko'p qism yuklash — bitta faslni ketma-ket videolar bilan to'ldirish\n"
             "Anime tahrirlash\n"
             "Animeni o'chirish\n"
             "Anime turini Bepul yoki Premium qilish\n"
