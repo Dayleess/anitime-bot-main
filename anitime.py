@@ -64,15 +64,67 @@ class BulkEpisodeState(StatesGroup):
     waiting_start = State()
     waiting_videos = State()
 
+class AddRequiredChannelState(StatesGroup):
+    waiting_channel = State()
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
+def get_required_channels() -> list[dict]:
+    channels = db.list_required_channels()
+    return channels or list(REQUIRED_CHANNELS)
+
+def is_valid_button_url(url: str | None) -> bool:
+    return bool(url) and url.startswith(("https://", "http://"))
+
+def normalize_channel_url(username: str, url: str | None = None) -> str:
+    raw = (url or "").strip()
+    if raw.startswith("httpa://"):
+        raw = "https://" + raw[8:]
+    if raw.startswith("http://"):
+        raw = "https://" + raw[7:]
+    if raw.startswith(("https://t.me/", "https://telegram.me/")):
+        return raw
+    if raw.startswith("https://"):
+        rest = raw[8:].lstrip("@")
+        if rest:
+            return f"https://t.me/{rest.split('/')[0]}"
+    uname = username.strip().lstrip("@")
+    return f"https://t.me/{uname}"
+
+def parse_channel_username(text: str) -> str:
+    value = text.strip()
+    for prefix in (
+        "https://t.me/",
+        "http://t.me/",
+        "https://telegram.me/",
+        "http://telegram.me/",
+        "t.me/",
+    ):
+        if value.lower().startswith(prefix):
+            value = value[len(prefix):]
+            break
+    value = value.split("?")[0].strip("/")
+    if value.startswith("+") or value.startswith("-"):
+        return value
+    return value if value.startswith("@") else f"@{value}"
+
+async def check_bot_is_channel_admin(chat_id) -> tuple[bool, str]:
+    me = await bot.get_me()
+    try:
+        member = await bot.get_chat_member(chat_id, me.id)
+    except Exception as e:
+        return False, str(e)
+    if member.status in ("administrator", "creator"):
+        return True, member.status
+    return False, member.status
+
 async def check_subscriptions(user_id: int) -> list[dict]:
     """Obuna bo'lmagan kanallar ro'yxatini qaytaradi"""
     not_subscribed = []
-    for ch in REQUIRED_CHANNELS:
+    for ch in get_required_channels():
         try:
             member = await bot.get_chat_member(ch["username"], user_id)
             if member.status not in ("creator", "administrator", "member", "restricted"):
@@ -85,10 +137,15 @@ async def check_subscriptions(user_id: int) -> list[dict]:
 
 def subscription_keyboard(not_subscribed: list[dict], anime_id: int) -> InlineKeyboardMarkup:
     """Obuna tugmalari klaviaturasi"""
-    buttons = [
-        [InlineKeyboardButton(text=f"📢 {ch['name']} ga obuna bo'lish", url=ch["url"])]
-        for ch in not_subscribed
-    ]
+    buttons = []
+    for ch in not_subscribed:
+        url = normalize_channel_url(ch["username"], ch.get("url"))
+        if not is_valid_button_url(url):
+            logging.error("Noto'g'ri obuna URL o'tkazib yuborildi: %s", url)
+            continue
+        buttons.append(
+            [InlineKeyboardButton(text=f"📢 {ch['name']} ga obuna bo'lish", url=url)]
+        )
     buttons.append([
         InlineKeyboardButton(
             text="✅ Obuna bo'ldim, tekshirish",
@@ -702,6 +759,157 @@ async def bulk_control(msg: types.Message, state: FSMContext):
 async def bulk_other(msg: types.Message):
     await msg.answer("❌ Faqat video fayl yuboring (yoki /done, /skip, /cancel).")
 
+# ─── Admin: Majburiy obuna kanallari ──────────────────────────────────────────
+
+async def show_required_channels_menu(msg_or_call):
+    channels = db.list_required_channels()
+    text = (
+        "📢 <b>Majburiy obuna</b>\n\n"
+        "Yangi kanal qo'shishdan oldin botni o'sha kanalga "
+        "<b>admin</b> qiling. Aks holda obuna tekshiruvi ishlamaydi.\n"
+    )
+    buttons = []
+    if channels:
+        text += "\nJoriy kanallar:\n"
+        for ch in channels:
+            is_ok, status = await check_bot_is_channel_admin(ch["username"])
+            icon = "✅" if is_ok else "⚠️"
+            status_text = "bot admin" if is_ok else f"bot admin emas ({status})"
+            text += (
+                f"\n{icon} <b>{html.escape(ch['name'])}</b>\n"
+                f"   {html.escape(ch['username'])}\n"
+                f"   {html.escape(status_text)}"
+            )
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"🗑 {ch['name']}",
+                    callback_data=f"del_reqch:{ch['id']}",
+                )
+            ])
+    else:
+        text += "\nHali kanal qo'shilmagan."
+
+    buttons.append([
+        InlineKeyboardButton(text="➕ Kanal qo'shish", callback_data="add_reqch")
+    ])
+    buttons.append([
+        InlineKeyboardButton(text="⬅️ Ro'yxatga", callback_data="list_page:0")
+    ])
+    markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    if isinstance(msg_or_call, types.Message):
+        await msg_or_call.answer(text, reply_markup=markup, parse_mode="HTML")
+    else:
+        await msg_or_call.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+        await msg_or_call.answer()
+
+@dp.message(Command("channels"))
+async def cmd_channels(msg: types.Message):
+    if not is_admin(msg.from_user.id):
+        return
+    await show_required_channels_menu(msg)
+
+@dp.callback_query(F.data == "req_channels")
+async def callback_req_channels(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("Bu amal faqat admin uchun.", show_alert=True)
+        return
+    await state.clear()
+    await show_required_channels_menu(call)
+
+@dp.callback_query(F.data == "add_reqch")
+async def callback_add_reqch(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("Bu amal faqat admin uchun.", show_alert=True)
+        return
+    await state.set_state(AddRequiredChannelState.waiting_channel)
+    await call.message.edit_text(
+        "➕ <b>Majburiy obuna kanalini qo'shish</b>\n\n"
+        "1) Botni kanalga <b>admin</b> qiling.\n"
+        "2) Kanal username, havola yoki kanal postini forward qiling.\n\n"
+        "Masalan: <code>@ommaviy_garem</code> yoki "
+        "<code>https://t.me/ommaviy_garem</code>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Bekor qilish", callback_data="req_channels")]
+        ]),
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+@dp.message(AddRequiredChannelState.waiting_channel)
+async def add_required_channel_input(msg: types.Message, state: FSMContext):
+    if not is_admin(msg.from_user.id):
+        await state.clear()
+        return
+    if msg.text and msg.text.startswith("/"):
+        await state.clear()
+        if msg.text.split("@")[0] in ("/list", "/channels"):
+            if msg.text.startswith("/list"):
+                return await cmd_list(msg)
+            return await cmd_channels(msg)
+        return
+
+    chat = None
+    try:
+        if msg.forward_from_chat and msg.forward_from_chat.type in ("channel", "supergroup"):
+            chat = msg.forward_from_chat
+        elif msg.text:
+            chat = await bot.get_chat(parse_channel_username(msg.text))
+        else:
+            await msg.answer("❌ Username, havola yoki kanal postini yuboring.")
+            return
+    except Exception as e:
+        await msg.answer(f"❌ Kanal topilmadi: {html.escape(str(e))}", parse_mode="HTML")
+        return
+
+    is_ok, status = await check_bot_is_channel_admin(chat.id)
+    if not is_ok:
+        me = await bot.get_me()
+        await msg.answer(
+            "❌ Kanal qabul qilinmadi, chunki bot bu kanalda <b>admin emas</b>.\n\n"
+            f"Holat: <code>{html.escape(str(status))}</code>\n\n"
+            "Qiling:\n"
+            f"1. Kanalga kiring → Administrators → Add Admin\n"
+            f"2. <b>@{html.escape(me.username)}</b> ni admin qiling "
+            "(a'zolarni ko'rish huquqi bilan)\n"
+            "3. Shu yerga kanalni qayta yuboring.",
+            parse_mode="HTML",
+        )
+        return
+
+    username = f"@{chat.username}" if chat.username else str(chat.id)
+    url = None
+    if chat.username:
+        url = f"https://t.me/{chat.username}"
+    else:
+        try:
+            url = await bot.export_chat_invite_link(chat.id)
+        except Exception:
+            url = chat.invite_link
+    if not is_valid_button_url(url):
+        await msg.answer("❌ Kanal uchun to'g'ri obuna havolasini olishning imkoni bo'lmadi.")
+        return
+
+    added = db.add_required_channel(chat.title or username, username, url)
+    await state.clear()
+    if not added:
+        await msg.answer("ℹ️ Bu kanal allaqachon majburiy obunada bor.")
+    else:
+        await msg.answer(
+            f"✅ <b>{html.escape(added['name'])}</b> majburiy obunaga qo'shildi.",
+            parse_mode="HTML",
+        )
+    await show_required_channels_menu(msg)
+
+@dp.callback_query(F.data.startswith("del_reqch:"))
+async def callback_del_reqch(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Bu amal faqat admin uchun.", show_alert=True)
+        return
+    channel_id = int(call.data.split(":", maxsplit=1)[1])
+    db.delete_required_channel(channel_id)
+    await show_required_channels_menu(call)
+
 # ─── Admin: List va Control ───────────────────────────────────────────────────
 
 ANIME_LIST_PAGE_SIZE = 8
@@ -756,6 +964,9 @@ async def show_list(user_id: int, msg_or_call, page: int = 0):
 
     buttons.append([
         InlineKeyboardButton(text="➕ Yangi anime qo'shish", callback_data="add_anime_btn")
+    ])
+    buttons.append([
+        InlineKeyboardButton(text="📢 Majburiy obuna", callback_data="req_channels")
     ])
 
     markup = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -910,6 +1121,7 @@ async def cmd_help(msg: types.Message):
         help_text += (
             "\n\n<b>Admin boshqaruvi:</b>\n"
             "/list - barcha animelarni boshqarish\n"
+            "/channels - majburiy obuna kanallari\n"
             "/help - ushbu yordam\n\n"
             "Premium so'rovlari tasdiqlash va rad etish tugmalari bilan "
             "sizga avtomatik keladi.\n\n"
@@ -920,7 +1132,8 @@ async def cmd_help(msg: types.Message):
             "Anime tahrirlash\n"
             "Animeni o'chirish\n"
             "Anime turini Bepul yoki Premium qilish\n"
-            "Kanalga post qilish"
+            "Kanalga post qilish\n"
+            "Majburiy obuna kanallarini qo'shish/o'chirish"
         )
 
     await msg.answer(help_text, parse_mode="HTML")
@@ -1214,6 +1427,7 @@ async def set_commands():
         BotCommand(command="premium_status", description="Obuna holatini tekshirish"),
         BotCommand(command="paysupport", description="Premium bo'yicha yordam"),
         BotCommand(command="list",   description="📋 Barcha animelar menus"),
+        BotCommand(command="channels", description="📢 Majburiy obuna"),
         BotCommand(command="help",   description="🛠 Yordam"),
     ]
     for admin_id in ADMIN_IDS:

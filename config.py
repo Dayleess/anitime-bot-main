@@ -9,12 +9,13 @@ load_dotenv(Path(__file__).resolve().with_name(".env"))
 TOKEN = os.getenv("BOT_TOKEN")
 
 # Admin Telegram ID'lari (o'zingizning ID'ingizni kiriting)
-ADMIN_IDS = [6981254334]  # <-- shu yerga o'z Telegram ID'ingizni qo'ying
+ADMIN_IDS = [6981254334]  
 
 # Majburiy obuna kanallari (username yoki -100xxxxxxxx formatda ID)
 REQUIRED_CHANNELS = [
     {"name": "Dayleess Donat", "username": "@Dayleess_Donat", "url": "https://t.me/Dayleess_Donat"},
     {"name": "Ani Time", "username": "@AniTime_here", "url": "https://t.me/AniTime_here"},
+    {"name": "Garem", "username": "@ommaviy_garem", "url": "https://t.me/ommaviy_garem"},
     # Qo'shimcha kanal qo'shish uchun yuqoridagi formatda yozing
 ]
 # Kanalga post joylash uchun kanal username yoki ID si

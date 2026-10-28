@@ -9,7 +9,7 @@ try:
 except ImportError:
     PSCOPG2_AVAILABLE = False
 
-from config import DATABASE_URL
+from config import DATABASE_URL, REQUIRED_CHANNELS
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "anime.db")
 
@@ -80,6 +80,15 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_premium_requests_user_status
             ON premium_requests (user_id, status);
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS required_channels (
+                id         SERIAL PRIMARY KEY,
+                name       TEXT NOT NULL,
+                username   TEXT NOT NULL UNIQUE,
+                url        TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
     else:
         # SQLite
         cur.executescript("""
@@ -135,6 +144,16 @@ def init_db():
                 "ALTER TABLE premium_subscriptions "
                 "ADD COLUMN expiry_warning_for INTEGER"
             )
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS required_channels (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                name       TEXT NOT NULL,
+                username   TEXT NOT NULL UNIQUE,
+                url        TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+    _seed_required_channels(cur)
     conn.commit()
     conn.close()
 
@@ -627,3 +646,95 @@ def reject_premium_request(request_id: int, admin_id: int) -> dict | None:
     conn.commit()
     conn.close()
     return {"user_id": int(row[0]), "plan_code": row[1]} if row else None
+
+def _is_postgres() -> bool:
+    return bool(DATABASE_URL and PSCOPG2_AVAILABLE)
+
+def _seed_required_channels(cur):
+    cur.execute("SELECT COUNT(*) FROM required_channels")
+    if int(cur.fetchone()[0]) > 0:
+        return
+    for ch in REQUIRED_CHANNELS:
+        if _is_postgres():
+            cur.execute(
+                """
+                INSERT INTO required_channels (name, username, url)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (username) DO NOTHING
+                """,
+                (ch["name"], ch["username"], ch["url"]),
+            )
+        else:
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO required_channels (name, username, url)
+                VALUES (?, ?, ?)
+                """,
+                (ch["name"], ch["username"], ch["url"]),
+            )
+
+def list_required_channels() -> list[dict]:
+    conn = get_connection()
+    if _is_postgres():
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(
+            "SELECT id, name, username, url FROM required_channels ORDER BY id"
+        )
+    else:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, name, username, url FROM required_channels ORDER BY id"
+        )
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def add_required_channel(name: str, username: str, url: str) -> dict | None:
+    conn = get_connection()
+    cur = conn.cursor()
+    if _is_postgres():
+        cur.execute(
+            "SELECT id FROM required_channels WHERE username = %s",
+            (username,),
+        )
+        existing = cur.fetchone()
+        if existing:
+            conn.close()
+            return None
+        cur.execute(
+            """
+            INSERT INTO required_channels (name, username, url)
+            VALUES (%s, %s, %s) RETURNING id
+            """,
+            (name, username, url),
+        )
+        channel_id = cur.fetchone()[0]
+    else:
+        cur.execute(
+            "SELECT id FROM required_channels WHERE username = ?",
+            (username,),
+        )
+        existing = cur.fetchone()
+        if existing:
+            conn.close()
+            return None
+        cur.execute(
+            "INSERT INTO required_channels (name, username, url) VALUES (?, ?, ?)",
+            (name, username, url),
+        )
+        channel_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return {"id": channel_id, "name": name, "username": username, "url": url}
+
+def delete_required_channel(channel_id: int) -> bool:
+    conn = get_connection()
+    cur = conn.cursor()
+    if _is_postgres():
+        cur.execute("DELETE FROM required_channels WHERE id = %s", (channel_id,))
+    else:
+        cur.execute("DELETE FROM required_channels WHERE id = ?", (channel_id,))
+    deleted = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
