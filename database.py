@@ -9,7 +9,7 @@ try:
 except ImportError:
     PSCOPG2_AVAILABLE = False
 
-from config import DATABASE_URL, REQUIRED_CHANNELS
+from config import DATABASE_URL, PREMIUM_PLANS, REQUIRED_CHANNELS
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "anime.db")
 
@@ -64,6 +64,10 @@ def init_db():
         cur.execute("""
             ALTER TABLE premium_subscriptions
             ADD COLUMN IF NOT EXISTS expiry_warning_for BIGINT;
+        """)
+        cur.execute("""
+            ALTER TABLE premium_subscriptions
+            ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0
         """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS premium_requests (
@@ -139,6 +143,8 @@ def init_db():
         """)
         cur.execute("PRAGMA table_info(premium_subscriptions)")
         premium_columns = {row[1] for row in cur.fetchall()}
+        if "revision" not in premium_columns:
+            cur.execute("ALTER TABLE premium_subscriptions ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
         if "expiry_warning_for" not in premium_columns:
             cur.execute(
                 "ALTER TABLE premium_subscriptions "
@@ -327,20 +333,20 @@ def get_premium_status(user_id: int) -> dict:
     if DATABASE_URL and PSCOPG2_AVAILABLE:
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute(
-            "SELECT expires_at, is_vip FROM premium_subscriptions WHERE user_id = %s",
+            "SELECT expires_at, is_vip, revision FROM premium_subscriptions WHERE user_id = %s",
             (user_id,),
         )
     else:
         cur = conn.cursor()
         cur.execute(
-            "SELECT expires_at, is_vip FROM premium_subscriptions WHERE user_id = ?",
+            "SELECT expires_at, is_vip, revision FROM premium_subscriptions WHERE user_id = ?",
             (user_id,),
         )
     row = cur.fetchone()
     conn.close()
 
     if not row:
-        return {"active": False, "is_vip": False, "expires_at": None}
+        return {"active": False, "is_vip": False, "expires_at": None, "revision": -1}
 
     status = dict(row)
     is_vip = bool(status["is_vip"])
@@ -348,6 +354,7 @@ def get_premium_status(user_id: int) -> dict:
     active = is_vip or (expires_at is not None and int(expires_at) > int(time.time()))
     return {
         "active": active,
+        "revision": status["revision"],
         "is_vip": is_vip,
         "expires_at": int(expires_at) if expires_at is not None else None,
     }
@@ -534,6 +541,72 @@ def get_premium_request(request_id: int) -> dict | None:
     conn.close()
     return dict(row) if row else None
 
+def premium_plan(code: str | None) -> dict | None:
+    if code and code.startswith("d") and code[1:].isascii() and code[1:].isdigit() and len(code) <= 5:
+        days = int(code[1:])
+        if days:
+            return {"name": f"{days} kun", "days": days}
+    return PREMIUM_PLANS.get(code)
+
+def _lock_subscription(cur, user_id):
+    if _is_postgres():
+        cur.execute("SELECT pg_advisory_xact_lock(%s)", (user_id,))
+        param, lock = "%s", " FOR UPDATE"
+    else:
+        param, lock = "?", ""  # The caller already holds BEGIN IMMEDIATE.
+    cur.execute(f"SELECT expires_at, is_vip, revision FROM premium_subscriptions WHERE user_id = {param}{lock}",
+                (user_id,))
+    return cur.fetchone()
+
+def _grant_subscription(cur, user_id, current, days):
+    param = "%s" if _is_postgres() else "?"
+    vip = days is None or bool(current and current[1])
+    expiry = None if vip else max(int(time.time()), (current[0] if current else None) or 0) + days * 86400
+    cur.execute(f"""
+        INSERT INTO premium_subscriptions (user_id, expires_at, is_vip, revision)
+        VALUES ({param}, {param}, {param}, 1)
+        ON CONFLICT (user_id) DO UPDATE SET
+            expires_at = excluded.expires_at, is_vip = excluded.is_vip,
+            expiry_warning_for = NULL, updated_at = CURRENT_TIMESTAMP,
+            revision = premium_subscriptions.revision + 1
+    """, (user_id, expiry, vip))
+    return expiry, vip
+
+def adjust_premium_subscription(user_id: int, admin_id: int, code: str, revision: int) -> bool:
+    """Apply a confirmed change only if the admin saw the current subscription."""
+    plan = premium_plan(code)
+    if code != "revoke" and not plan:
+        raise ValueError("Unknown Premium plan")
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        param = "%s" if _is_postgres() else "?"
+        if not _is_postgres():
+            cur.execute("BEGIN IMMEDIATE")
+        current = _lock_subscription(cur, user_id)
+        if revision != (current[2] if current else -1):
+            return False
+        if code == "revoke":
+            if not current or not (current[1] or (current[0] or 0) > int(time.time())):
+                return False
+            cur.execute(f"""
+                UPDATE premium_subscriptions SET expires_at = NULL, is_vip = FALSE,
+                    expiry_warning_for = NULL, updated_at = CURRENT_TIMESTAMP, revision = revision + 1
+                WHERE user_id = {param}
+            """, (user_id,))
+        else:
+            if current and current[1]:
+                return False
+            _grant_subscription(cur, user_id, current, plan["days"])
+            cur.execute(f"""
+                INSERT INTO premium_requests (user_id, plan_code, status, resolved_by, resolved_at)
+                VALUES ({param}, {param}, 'approved', {param}, CURRENT_TIMESTAMP)
+            """, (user_id, code, admin_id))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
 def approve_premium_request(
     request_id: int,
     admin_id: int,
@@ -562,59 +635,8 @@ def approve_premium_request(
         return None
 
     user_id, plan_code = int(request_row[0]), request_row[1]
-    if is_postgres:
-        cur.execute("SELECT pg_advisory_xact_lock(%s)", (user_id,))
-        cur.execute(
-            "SELECT expires_at, is_vip FROM premium_subscriptions WHERE user_id = %s FOR UPDATE",
-            (user_id,),
-        )
-    else:
-        cur.execute(
-            "SELECT expires_at, is_vip FROM premium_subscriptions WHERE user_id = ?",
-            (user_id,),
-        )
-
-    current_row = cur.fetchone()
-    current = (
-        {"expires_at": current_row[0], "is_vip": current_row[1]}
-        if current_row
-        else None
-    )
-
-    now = int(time.time())
-    already_vip = bool(current and current["is_vip"])
-    if already_vip or duration_days is None:
-        expires_at = None
-        is_vip = True
-    else:
-        current_expiry = int(current["expires_at"]) if current and current["expires_at"] else 0
-        expires_at = max(now, current_expiry) + duration_days * 24 * 60 * 60
-        is_vip = False
-
-    if is_postgres:
-        cur.execute(
-            """
-            INSERT INTO premium_subscriptions (user_id, expires_at, is_vip, updated_at)
-            VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
-            ON CONFLICT (user_id) DO UPDATE SET
-                expires_at = EXCLUDED.expires_at,
-                is_vip = EXCLUDED.is_vip,
-                updated_at = CURRENT_TIMESTAMP
-            """,
-            (user_id, expires_at, is_vip),
-        )
-    else:
-        cur.execute(
-            """
-            INSERT INTO premium_subscriptions (user_id, expires_at, is_vip, updated_at)
-            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(user_id) DO UPDATE SET
-                expires_at = excluded.expires_at,
-                is_vip = excluded.is_vip,
-                updated_at = CURRENT_TIMESTAMP
-            """,
-            (user_id, expires_at, int(is_vip)),
-        )
+    current = _lock_subscription(cur, user_id)
+    expires_at, is_vip = _grant_subscription(cur, user_id, current, duration_days)
 
     if is_postgres:
         cur.execute(
