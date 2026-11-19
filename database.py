@@ -352,6 +352,34 @@ def get_premium_status(user_id: int) -> dict:
         "expires_at": int(expires_at) if expires_at is not None else None,
     }
 
+def list_active_premium_subscribers(page: int, page_size: int) -> tuple[int, int, list[dict]]:
+    """Return the total, the current page (zero-based), and its active subscribers."""
+    now = int(time.time())
+    param = "%s" if _is_postgres() else "?"
+    active = f"(s.is_vip OR s.expires_at > {param})"
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT COUNT(*) FROM premium_subscriptions s WHERE {active}", (now,))
+        total = cur.fetchone()[0]
+        page = max(0, min(page, (total - 1) // page_size))
+        cur.execute(f"""
+            SELECT s.user_id, s.is_vip, s.expires_at,
+                   (SELECT r.plan_code FROM premium_requests r
+                    WHERE r.user_id = s.user_id AND r.status = 'approved'
+                    ORDER BY r.resolved_at DESC, r.id DESC LIMIT 1)
+            FROM premium_subscriptions s
+            WHERE {active}
+            ORDER BY s.is_vip, s.expires_at, s.user_id
+            LIMIT {param} OFFSET {param}
+        """, (now, page_size, page * page_size))
+        return total, page, [
+            {"user_id": uid, "is_vip": vip, "expires_at": expiry, "plan_code": plan}
+            for uid, vip, expiry, plan in cur.fetchall()
+        ]
+    finally:
+        conn.close()
+
 def claim_expiring_premium_notifications(
     within_seconds: int = 24 * 60 * 60,
     limit: int = 100,

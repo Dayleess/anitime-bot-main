@@ -2,9 +2,10 @@ import asyncio
 import html
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 from aiogram import Bot, Dispatcher, types, F
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     InlineKeyboardMarkup,
@@ -180,7 +181,7 @@ async def send_premium_menu(user_id: int, premium_anime: str | None = None):
         await bot.send_message(
             user_id,
             "<b>Siz bot adminisiz.</b>\n\n"
-            "Barcha Premium animelar siz uchun doim ochiq.",
+            "Faol obunachilar, tariflar va muddatlarni ko'rish: /premium_users",
             parse_mode="HTML",
         )
         return
@@ -232,13 +233,85 @@ async def cmd_premium(msg: types.Message):
 @dp.message(Command("premium_status"))
 async def cmd_premium_status(msg: types.Message):
     if is_admin(msg.from_user.id):
-        await msg.answer(
-            "Siz bot adminisiz. Barcha Premium animelar siz uchun doim ochiq."
-        )
+        await cmd_premium_users(msg)
         return
 
     status = db.get_premium_status(msg.from_user.id)
     await msg.answer(format_premium_status(status))
+
+PREMIUM_PAGE_SIZE = 8
+TASHKENT_TIME = timezone(timedelta(hours=5))
+
+async def subscriber_link(user_id: int) -> str:
+    label = f"ID {user_id}"
+    try:
+        chat = await bot.get_chat(user_id, request_timeout=3)
+        name = f"@{chat.username}" if chat.username else chat.full_name
+        if name:
+            label = html.escape(name)
+    except (TelegramAPIError, TimeoutError):
+        pass  # The saved Telegram ID also identifies users with an unavailable profile.
+    return f'<a href="tg://user?id={user_id}">{label}</a>'
+
+async def premium_subscribers_page(page: int = 0):
+    total, page, subscribers = await asyncio.to_thread(
+        db.list_active_premium_subscribers, page, PREMIUM_PAGE_SIZE
+    )
+    lines = [f"<b>Faol Premium obunachilar: {total} ta</b>"]
+    if not subscribers:
+        return "\n".join(lines + ["Hozircha faol obunachi yo'q."]), None
+
+    profiles = await asyncio.gather(*(subscriber_link(s["user_id"]) for s in subscribers))
+    now = datetime.now(TASHKENT_TIME)
+    for index, (sub, profile) in enumerate(zip(subscribers, profiles), page * PREMIUM_PAGE_SIZE + 1):
+        if sub["is_vip"]:
+            details = "VIP · umrbod"
+        else:
+            expiry = datetime.fromtimestamp(sub["expires_at"], TASHKENT_TIME)
+            remaining = (expiry - now).total_seconds()
+            days = int(remaining // 86400)
+            if remaining <= 0:
+                time_left = "muddati tugadi"
+            elif days == 0:
+                time_left = "1 kundan kam qoldi"
+            else:
+                time_left = f"{days} kun qoldi"
+            plan = PREMIUM_PLANS.get(sub["plan_code"])
+            tariff = f"Oxirgi tarif: {plan['name']} · " if plan else ""
+            details = f"{tariff}{expiry:%d.%m.%Y %H:%M} gacha (Toshkent), {time_left}"
+        lines.append(f"{index}. {profile}\n{details}")
+
+    pages = (total + PREMIUM_PAGE_SIZE - 1) // PREMIUM_PAGE_SIZE
+    buttons = []
+    if page > 0:
+        buttons.append(InlineKeyboardButton(text="⬅️ Oldingi", callback_data=f"premium_page:{page - 1}"))
+    if page + 1 < pages:
+        buttons.append(InlineKeyboardButton(text="Keyingi ➡️", callback_data=f"premium_page:{page + 1}"))
+    if buttons:
+        lines.append(f"Sahifa {page + 1}/{pages}")
+    markup = InlineKeyboardMarkup(inline_keyboard=[buttons]) if buttons else None
+    return "\n\n".join(lines), markup
+
+@dp.message(Command("premium_users"))
+async def cmd_premium_users(msg: types.Message):
+    if not msg.from_user or not is_admin(msg.from_user.id):
+        await msg.answer("Bu buyruq faqat admin uchun.")
+        return
+    if msg.chat.type != "private":
+        await msg.answer("Obunachilarni ko'rish uchun botning shaxsiy chatida /premium_users yuboring.")
+        return
+    text, markup = await premium_subscribers_page()
+    await msg.answer(text, reply_markup=markup, parse_mode="HTML")
+
+@dp.callback_query(F.data.regexp(r"^premium_page:[0-9]+$"))
+async def callback_premium_page(call: CallbackQuery):
+    if not is_admin(call.from_user.id) or not call.message or call.message.chat.type != "private":
+        await call.answer("Ro'yxat faqat adminning shaxsiy chatida ochiladi.", show_alert=True)
+        return
+    await call.answer()
+    page = int(call.data.split(":")[1])
+    text, markup = await premium_subscribers_page(page)
+    await call.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
 
 @dp.message(Command("paysupport"))
 async def cmd_paysupport(msg: types.Message):
@@ -1120,6 +1193,7 @@ async def cmd_help(msg: types.Message):
     if is_admin(msg.from_user.id):
         help_text += (
             "\n\n<b>Admin boshqaruvi:</b>\n"
+            "/premium_users - faol obunachilar, tariflar va muddatlar\n"
             "/list - barcha animelarni boshqarish\n"
             "/channels - majburiy obuna kanallari\n"
             "/help - ushbu yordam\n\n"
@@ -1423,8 +1497,9 @@ async def set_commands():
 
     admin_commands = [
         BotCommand(command="start",  description="Botni ishga tushirish"),
+        BotCommand(command="premium_users", description="Faol obunachilar, tariflar va muddatlar"),
         BotCommand(command="premium", description="Premium olish"),
-        BotCommand(command="premium_status", description="Obuna holatini tekshirish"),
+        BotCommand(command="premium_status", description="Faol Premium obunachilarni ko'rish"),
         BotCommand(command="paysupport", description="Premium bo'yicha yordam"),
         BotCommand(command="list",   description="📋 Barcha animelar menus"),
         BotCommand(command="channels", description="📢 Majburiy obuna"),
